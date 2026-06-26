@@ -1,0 +1,14 @@
+# 复制为 .dev.vars 并填入真实值用于本地 `wrangler dev`。
+# .dev.vars 已被 .gitignore 忽略，不会提交。值见 userscript/调用信息.txt.rtf
+
+DDP_APP_ID=填你的AppId
+DDP_APP_SECRET=填应用密钥1或密钥2
+
+# 可选：设置后脚本须在请求头带 X-Proxy-Token: 同值
+# PROXY_TOKEN=
+
+# 可选：默认 both（同时发凭证+签名两种鉴权，最大化兼容）
+# DDP_AUTH_MODE=both
+
+# 可选：CORS，默认 *
+# ALLOWED_ORIGIN=*

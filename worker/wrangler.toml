@@ -1,0 +1,18 @@
+# Cloudflare Worker 配置 —— 弹弹play API 代理
+# 部署：cd userscript/worker && npx wrangler deploy
+# 本地：npx wrangler dev
+
+name = "dandanplay-proxy"
+main = "dandanplay-proxy.js"
+compatibility_date = "2024-11-06"
+
+# 普通变量（非密钥，可安全提交）
+[vars]
+ALLOWED_ORIGIN = "*"        # 收紧 CORS：填你的站点 origin，如 https://your-openlist.example
+DDP_AUTH_MODE = "both"      # both | credential | signature
+
+# 密钥请用 `wrangler secret put` 注入（不会写入本文件、不进仓库）：
+#   npx wrangler secret put DDP_APP_ID
+#   npx wrangler secret put DDP_APP_SECRET
+#   npx wrangler secret put PROXY_TOKEN      # 可选，防滥用
+# 值见 userscript/调用信息.txt.rtf
