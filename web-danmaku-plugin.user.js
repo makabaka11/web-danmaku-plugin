@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         今天要来点弹幕吗？
-// @version      1.0.0
-// @description  在任意网页视频上加载 B 站网页版同款弹幕引擎（Titan）；OpenList 同目录自动载入 / 本地手动载入 / 弹弹play 在线搜索+智能匹配（支持 AI 增强）+ 支持亮暗主题；经自部署 CF Worker 代理密钥不进脚本
+// @version      1.1.0
+// @description  在任意网页视频上加载 B 站网页版同款弹幕引擎（Titan）；OpenList 同目录自动载入 / 本地手动载入 / 弹弹play 在线搜索+智能匹配（支持 AI 增强全自动载入）；
 // @author       Retr0
 // @match        *://*/*
 // @include      http://*:5244/*
@@ -10,7 +10,7 @@
 // （OpenList:5244/localhost 自动识别为特例；@include 5244 仅为兼容旧油猴版本的显式声明，可省）
 // @require      https://cdn.jsdelivr.net/gh/makabaka11/DFM-Next@master/titan-bundle.js
 // @grant        none
-// @run-at       document-idle
+// @run-at       document-end
 // @homepageURL  https://github.com/makabaka11/web-danmaku-plugin
 // @supportURL   https://github.com/makabaka11/web-danmaku-plugin
 // @license       MIT
@@ -65,6 +65,13 @@
   // ============= 配置 =============
   const DANMAKU_EXTS = ['.xml', '.json', '.jsonl', '.ndjson', '.csv', '.txt'];
   const OPENLIST_API = location.origin;
+  // 页面标题快照：优先取顶层窗口标题（iframe 里脚本拿的是 iframe 的 title，真正番剧标题在 top）
+  // 跨域 iframe 访问 top.document 会抛错，兜底用当前 document.title
+  const _PAGE_TITLE_SNAPSHOT = (() => {
+    try { if (window.top && window.top !== window) return (window.top.document.title || '').trim(); }
+    catch (e) { /* 跨域 iframe，无权限访问 top */ }
+    return (document.title || '').trim();
+  })();
 
   // ============= 弹幕文件解析（4 种格式 + 通用入口） =============
   function parseBiliXml(text) {
@@ -216,6 +223,25 @@
       const u = new URL(src, location.origin);
       return decodeURIComponent(u.pathname).replace(/^\/p/, '') || null;
     } catch (e) { return null; }
+  }
+
+  // 从网页标题提取番剧信息。优先当前 document.title（SPA导航标题会变），
+  // 仅当当前标题疑似被播放器库覆盖（太短/占位名）时回退脚本加载快照。
+  function getPageTitle() {
+    // 优先取顶层窗口标题（iframe 里的脚本拿 document.title 是 iframe 自己的 title）
+    let live;
+    try { live = (window.top && window.top !== window) ? (window.top.document.title || '').trim() : ''; }
+    catch (e) { live = ''; }
+    if (!live || live.length < 2) live = (document.title || '').trim();
+    // 当前标题疑似被播放器库覆盖（太短/占位名）→ 用快照
+    let t = live;
+    if (live.length < 6 || /^(Artplayer|Video|Player|Media|Play|播放器?)$/i.test(live)) {
+      t = _PAGE_TITLE_SNAPSHOT;
+    }
+    if (!t || t.length < 2) return '';
+    // 只去掉明确的站点名后缀
+    t = t.replace(/\s*[-–—|｜]\s*(bilibili|哔哩哔哩|YouTube|AcFun|巴哈姆特|動畫瘋|Netflix|Amazon\s*Prime|Hulu|Disney\+|Crunchyroll|Funimation|HIDIVE|iQIYI|爱奇艺|优酷|腾讯视频|芒果TV|B站)\s*$/i, '');
+    return t.trim().length >= 2 ? t.trim() : '';
   }
 
   // ============= 列同目录找候选弹幕文件 =============
@@ -593,7 +619,7 @@
   //   用户可在「⚙ 通用设置 → 弹弹play 代理」覆盖（留空即用默认）。脚本内不硬编码任何密钥。
   const DDP_KEY = '__titan_dm_ddp__';
   // 默认值：作者自部署的 Worker。token 是防滥用口令（非密钥），写死公开无碍——但若脚本被大量分发，
-  // 所有用户流量会集中打到这个 Worker，可能触发弹弹play 分层配额（20.8.06-25 起）；建议重度用户自部署。
+  // 所有用户流量会集中打到这个 Worker，可能触发弹弹play 分层配额（21.0.06-25 起）；建议重度用户自部署。
   const DEFAULT_DDP_WORKER_URL = 'https://ddplay.retr0.xyz';
   const DEFAULT_DDP_PROXY_TOKEN = '8TUf1AYTwQFjGv';
   const ddpCache = new Map();        // 会话内搜索结果缓存（keyword → SearchEpisodesResponse），降配额
@@ -676,6 +702,8 @@
   }
   // 智能匹配按钮是否显示：仅当 AI 开关开启时（配置不全点开会提示去填）
   function aiMatchVisible() { return aiEnabled(); }
+  // 全自动载入：开页面自动匹配→单结果自动载入，全程零操作
+  function autoMatchEnabled() { return !!(loadAiConfig().autoMatch && aiReady()); }
   // 调用 LLM（经 Worker /llm 代理）提取文件名 → {title, episode}
   // prompt 要求只返回 JSON。失败返回 null（调用方回退到原 fileName 匹配）。
   const LLM_TIMEOUT_MS = 20000;
@@ -731,9 +759,12 @@
   }
 
   // 拉取某 episodeId 的弹幕（CommentResponseV2）—— Worker 会自动跟随 302 到 CDN
+  // chConvert 从用户设置读取：0=不转换 1=简体(默认) 2=繁体
   async function ddpGetComment(episodeId) {
+    const ch = loadSettings().ddpChConvert;
+    const chConvert = (ch != null && ch >= 0 && ch <= 2) ? ch : 1;
     return await ddpFetch('/api/v2/comment/' + encodeURIComponent(episodeId), {
-      query: { withRelated: 'true' },  // 整合关联的第三方弹幕（A/B/C 站），一次拿全
+      query: { withRelated: 'true', chConvert: String(chConvert) },
     });
   }
 
@@ -1012,6 +1043,7 @@
         html.__titan_dm_light__ #__titan_dm_settings .modal-title{color:#111;border-color:rgba(0,0,0,0.08)}
         html.__titan_dm_light__ #__titan_dm_settings .modal-section{color:#888}
         html.__titan_dm_light__ #__titan_dm_settings .row>label{color:#666}
+        html.__titan_dm_light__ #__titan_dm_settings select{background:#fff;color:#222;border-color:#ccc}
         html.__titan_dm_light__ #__titan_dm_settings .btn{background:rgba(0,0,0,0.04);color:#222;border-color:rgba(0,0,0,0.12)}
         html.__titan_dm_light__ #__titan_dm_settings .btn:hover{background:rgba(0,0,0,0.08);border-color:rgba(0,0,0,0.2)}
         html.__titan_dm_light__ #__titan_dm_settings .btn-danger{background:rgba(220,50,50,0.08);color:#c33;border-color:rgba(220,50,50,0.25)}
@@ -1153,11 +1185,13 @@
       <div class="modal-section">弹弹play 代理</div>
       <div class="row"><label>Worker URL</label><input type="text" id="__dm_ddp_url__" placeholder="留空用默认内置 API" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
       <div class="row"><label>Token</label><input type="text" id="__dm_ddp_token__" placeholder="留空用默认" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
+      <div class="row"><label>简繁转换</label><select id="__dm_chconvert__" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px;cursor:pointer"><option value="1">转换为简体（默认）</option><option value="0">不转换</option><option value="2">转换为繁体</option></select></div>
       <div class="row"><button class="btn btn-primary" id="__dm_ddp_save__">保存代理配置</button></div>
       <div class="row"><label>匹配缓存</label><button class="btn btn-danger" id="__dm_ddp_clear_match__">清空已匹配记录</button></div>
       <p class="hint">部署自己的 Worker 见 <code style="font-size:10px">userscript/worker/README.md</code>；匹配过的视频会记住，下次「智能匹配」直接命中，免重复请求。</p>
       <div class="modal-section">AI 配置（智能匹配增强）</div>
       <div class="row"><label>启用 AI</label><div id="__dm_ai_switch__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">开启后「✨ 智能匹配」用 LLM 提取文件名</span></div>
+      <div class="row"><label>全自动载入</label><div id="__dm_auto_match__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">打开视频自动匹配标题→单结果自动载入弹幕（零操作）</span></div>
       <div class="row"><label>API 地址</label><input type="text" id="__dm_ai_url__" placeholder="https://api.deepseek.com/v1" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
       <div class="row"><label>Key</label><input type="text" id="__dm_ai_key__" placeholder="sk-...（OpenAI 兼容）" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
       <div class="row"><label>模型</label><input type="text" id="__dm_ai_model__" placeholder="deepseek-chat / gpt-4o-mini 等" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
@@ -1166,7 +1200,7 @@
       <div class="modal-section">关于</div>
       <div class="about">
         <p><b class="about-brand"> 今天要来点弹幕吗？</b></p>
-        <p>脚本版本：<code id="__dm_ver_script__">0.8.0</code></p>
+        <p>脚本版本：<code id="__dm_ver_script__">1.1.0</code></p>
         <p>引擎：B 站原版 <code>bili-danmaku-x</code>代号[Titan]</p>
         <p>Bundle：<a href="https://cdn.jsdelivr.net/gh/makabaka11/DFM-Next@master/titan-bundle.js" target="_blank">jsDelivr</a>（11.4 MB）</p>
         <p>仓库：<a href="https://github.com/makabaka11/web-danmaku-plugin" target="_blank">github.com/makabaka11/web-danmaku-plugin</a></p>
@@ -1314,17 +1348,23 @@
       } catch (e) { ddpSetStatus('搜索失败: ' + e.message, true); }
     }
 
-    // 智能匹配：取视频文件名 + 大小 → POST /match；单结果确认载入，多结果列出供选，无结果回退搜索
+    // 智能匹配：优先用网页标题（更通用，非 OpenList 站点也能提取番剧信息），
+    // 回退到视频文件名；再经 AI（开）/match（关）定位剧集。
     async function doDdpMatch() {
       if (!ddpReady()) { ddpSetStatus('未配置代理，请先在通用设置填写 Worker URL', true); return; }
+      // ① 主信息源：网页标题（含番剧名+集号，适用于 B站/YT/巴哈等）
+      const pageTitle = getPageTitle() || '';
+      // ② 回退信息源：视频文件名（OpenList 同目录场景）
       let fileName = '';
       try { const fp = filePathFromVideo(video) || ''; fileName = (fp.split(/[\\/]/).pop() || fp).replace(/\.[^.]+$/, ''); } catch (e) {}
+      // 优先用网页标题（更通用、信息更全），没有再用文件名
+      const matchText = pageTitle || fileName;
       const src = video.currentSrc || video.src || '';
-      if (!fileName || fileName.length < 2 || /^blob:/i.test(src)) {
-        ddpSetStatus('当前视频无可用文件名（blob/流媒体），请改用关键词搜索', true);
+      if (!matchText || matchText.length < 2) {
+        ddpSetStatus('当前视频无可用匹配信息（网页标题/文件名均空），请改用关键词搜索', true);
         return;
       }
-      // ① 持久化缓存命中：之前匹配过并确认载入过这个文件 → 直接建议载入，免再发 /match
+      // ③ 持久化缓存命中：之前匹配过并确认载入过这个文件 → 直接建议载入
       const cached = getMatchCache(video);
       if (cached && cached.episodeId) {
         const label = (cached.animeTitle || '') + ' ' + (cached.episodeTitle || '');
@@ -1333,7 +1373,6 @@
           loadDandanplayComment(cached.episodeId, label);
         } else {
           ddpSetStatus('已取消缓存结果，可重新匹配');
-          // 用户想换：清除本条缓存，走下方重新匹配
           const k = matchCacheKeyOf(video);
           if (k) { const m = loadMatchCache(); delete m[k]; saveMatchCache(m); }
         }
@@ -1342,8 +1381,7 @@
       let fileSize = 0;
       try { const head = await fetch(src, { method: 'HEAD' }); const cl = head.headers.get('Content-Length'); if (cl) fileSize = +cl; } catch (e) {}
 
-      // ② AI 提取（开关开启时一定走 AI）：用 LLM 清洗文件名 → {title, episode} → search/episodes 定位
-      //    开关开但配置不全 → 提示去填，不静默回退 /match（用户明确选择用 AI）。
+      // ④ AI 提取（开关开启时一定走 AI）：用 matchText（优先标题）经 LLM 清洗 → {title, episode} → 搜索
       if (aiEnabled()) {
         if (!aiReady()) {
           ddpSetStatus('🤖 AI 已开启但配置不全（缺 API 地址/模型），请到通用设置填写', true);
@@ -1353,8 +1391,8 @@
           return;
         }
         try {
-          ddpSetStatus('🤖 AI 提取文件名中… ' + fileName, false, { loading: true });
-          const ext = await llmExtractFileName(fileName);
+          ddpSetStatus('🤖 AI 提取中… ' + matchText.slice(0, 50), false, { loading: true });
+          const ext = await llmExtractFileName(matchText);
           if (ext && ext.title) {
             ddpSetStatus('🤖 AI 提取: ' + ext.title + (ext.episode ? ' 第' + ext.episode + '集' : '（剧场版）') + '，搜索中…', false, { loading: true });
             const res = await ddpSearchEpisodes(ext.title, ext.episode);
@@ -1367,47 +1405,54 @@
               ddpSetStatus('🤖 AI 命中 ' + animes.length + ' 部作品' + (ext.episode ? '（已定位第' + ext.episode + '集）' : '') + '，点击载入');
               return;
             }
-            // AI 提取成功但没搜到：用提取的 title 预填搜索框，让用户调整
             ddpSetStatus('🤖 AI 提取到「' + ext.title + '」但未搜到作品，请调整关键词', true);
             $('__ddp_kw__').value = ext.title;
             return;
           }
-          ddpSetStatus('🤖 AI 未能从文件名提取，请改用关键词搜索', true);
-          return;  // 开关开则不回退 /match
+          ddpSetStatus('🤖 AI 未能从信息提取，请改用关键词搜索', true);
+          return;
         } catch (e) {
           ddpSetStatus('🤖 AI 提取失败: ' + e.message + '（开关已开，不回退文件名匹配）', true);
           return;
         }
       }
 
-      // ③ AI 未开启：POST /match 用原始文件名匹配
+      // ⑤ AI 未开启：有文件名走 /match，否则用网页标题/文件名搜索
       try {
-        ddpSetStatus('匹配中… ' + fileName, false, { loading: true });
-        const res = await ddpMatch(fileName, fileSize);
-        const matches = (res && res.matches) || [];
-        if (!matches.length) {
-          ddpSetStatus('未匹配到，已用文件名搜索', true);
-          $('__ddp_kw__').value = fileName;
-          doDdpSearch();
-          return;
-        }
-        if (res.isMatched && matches.length === 1) {
-          const m = matches[0];
-          const label = (m.animeTitle || '') + ' ' + (m.episodeTitle || '');
-          if (confirm('智能匹配到：\n' + label + '\n\n载入该集弹幕？')) {
-            loadDandanplayComment(m.episodeId, label);
-            putMatchCache(video, { episodeId: m.episodeId, animeTitle: m.animeTitle, episodeTitle: m.episodeTitle });  // 记录确认载入
-          } else ddpSetStatus('已取消');
+        // 如果有文件名（且非 blob），优先用精确匹配接口
+        if (fileName && fileName.length >= 2 && !/^blob:/i.test(src)) {
+          ddpSetStatus('匹配中… ' + fileName, false, { loading: true });
+          const res = await ddpMatch(fileName, fileSize);
+          const matches = (res && res.matches) || [];
+          if (!matches.length) {
+            // /match 无结果：用文件名搜索
+            ddpSetStatus('未匹配到，已用文件名搜索', true);
+            $('__ddp_kw__').value = fileName;
+            doDdpSearch();
+            return;
+          }
+          if (res.isMatched && matches.length === 1) {
+            const m = matches[0];
+            const label = (m.animeTitle || '') + ' ' + (m.episodeTitle || '');
+            if (confirm('智能匹配到：\n' + label + '\n\n载入该集弹幕？')) {
+              loadDandanplayComment(m.episodeId, label);
+              putMatchCache(video, { episodeId: m.episodeId, animeTitle: m.animeTitle, episodeTitle: m.episodeTitle });
+            } else ddpSetStatus('已取消');
+          } else {
+            ddpLastResults = {
+              animes: [{
+                animeId: 0, animeTitle: '匹配候选（' + matches.length + '）', type: '', startDate: null,
+                episodes: matches.map(m => ({ episodeId: m.episodeId, episodeTitle: ((m.animeTitle ? m.animeTitle + ' ' : '') + (m.episodeTitle || '')), episodeNumber: '' })),
+              }],
+            };
+            renderDdpEpisodes(ddpLastResults.animes[0]);
+            ddpSetStatus('匹配到 ' + matches.length + ' 个候选，请选择');
+          }
         } else {
-          // 多候选：当作一个"作品"展开其剧集列表供选择
-          ddpLastResults = {
-            animes: [{
-              animeId: 0, animeTitle: '匹配候选（' + matches.length + '）', type: '', startDate: null,
-              episodes: matches.map(m => ({ episodeId: m.episodeId, episodeTitle: ((m.animeTitle ? m.animeTitle + ' ' : '') + (m.episodeTitle || '')), episodeNumber: '' })),
-            }],
-          };
-          renderDdpEpisodes(ddpLastResults.animes[0]);
-          ddpSetStatus('匹配到 ' + matches.length + ' 个候选，请选择');
+          // 无可用文件名（流媒体/非 OpenList 站点）：用网页标题直接搜索
+          ddpSetStatus('搜索中… ' + matchText.slice(0, 30), false, { loading: true });
+          $('__ddp_kw__').value = matchText;
+          doDdpSearch();
         }
       } catch (e) { ddpSetStatus('匹配失败: ' + e.message, true); }
     }
@@ -1428,6 +1473,36 @@
       ddpModal.classList.remove('open');
       ddpMask.classList.remove('open');
     }
+
+    // 全自动载入：页面加载时自动取标题→AI提取→搜索→单结果自动载入，全程零操作
+    async function tryAutoMatch() {
+      if (!autoMatchEnabled()) return;
+      const title = getPageTitle();
+      if (!title || title.length < 2) return;
+      showStatus('⏳ 自动匹配中…', 0);  // 持续显示，直到结果出来
+      try {
+        const ext = await llmExtractFileName(title);
+        if (!ext || !ext.title) { showStatus(''); return; }
+        const res = await ddpSearchEpisodes(ext.title, ext.episode);
+        const animes = (res && res.animes) || [];
+        const single = animes.length === 1 && animes[0].episodes && animes[0].episodes.length === 1;
+        if (!single) {
+          if (animes.length > 1) showStatus('🎬 自动匹配到多部作品（' + animes.length + '），可手动搜索');
+          else showStatus('');
+          return;
+        }
+        const a = animes[0]; const e = a.episodes[0];
+        const label = (a.animeTitle || '') + ' ' + (e.episodeTitle || ('第' + (e.episodeNumber || 1) + '集'));
+        const rawList = ddpCommentsToList((await ddpGetComment(e.episodeId)).comments || []);
+        if (!rawList.length) { showStatus('🎬 自动匹配到 ' + label + ' 但该集无弹幕'); return; }
+        applyDanmakuList(rawList, label, { seekTo: video.currentTime || 0 });
+        putMatchCache(video, { episodeId: e.episodeId, animeTitle: a.animeTitle, episodeTitle: e.episodeTitle });
+        showStatus('🎬 自动载入: ' + label + ' · ' + rawList.length + ' 条');
+      } catch (e) { showStatus(''); }
+    }
+    // 注册到 engine 上，供 tryInit 在 autoLoad 后调用
+    engine.__titanAutoMatch = tryAutoMatch;
+
     $('__ddp_close__').addEventListener('click', closeDdpModal);
     ddpMask.addEventListener('click', closeDdpModal);
     $('__ddp_back__').addEventListener('click', () => {
@@ -1670,10 +1745,18 @@
       const m2 = $('__ddp_match2__'); if (m2) m2.style.display = show ? '' : 'none';
       // 开关 UI 同步
       const sw = $('__dm_ai_switch__'); if (sw) sw.classList.toggle('on', aiEnabled());
+      const am = $('__dm_auto_match__'); if (am) am.classList.toggle('on', autoMatchEnabled());
     }
     $('__dm_ai_switch__').addEventListener('click', () => {
       const cfg = loadAiConfig();
       cfg.enabled = !cfg.enabled;
+      saveAiConfig(cfg);
+      refreshAiMatchVisibility();
+    });
+    // 全自动载入开关
+    $('__dm_auto_match__').addEventListener('click', () => {
+      const cfg = loadAiConfig();
+      cfg.autoMatch = !cfg.autoMatch;
       saveAiConfig(cfg);
       refreshAiMatchVisibility();
     });
@@ -1682,6 +1765,7 @@
       const old = loadAiConfig();
       saveAiConfig({
         enabled: !!old.enabled,
+        autoMatch: !!old.autoMatch,
         baseUrl: $('__dm_ai_url__').value.trim(),
         apiKey: $('__dm_ai_key__').value.trim(),
         model: $('__dm_ai_model__').value.trim(),
@@ -1692,6 +1776,13 @@
       else if (aiReady()) alert('AI 配置已保存 ✓ 且可用 ✓\n模型：' + cfg.model + '\n现在「✨ 智能匹配」按钮会显示。');
       else alert('已保存，但 API 地址/模型为空，AI 不可用。请补全后重试。');
     });
+    // 简繁转换：下拉改即存（弹弹play comment 接口的 chConvert 参数）
+    $('__dm_chconvert__').addEventListener('change', () => {
+      const v = parseInt($('__dm_chconvert__').value, 10);
+      const s = loadSettings();
+      s.ddpChConvert = (v >= 0 && v <= 2) ? v : 1;
+      saveSettings(s);
+    });
 
     // 通用设置弹窗：open / close
     function openSettingsModal() {
@@ -1701,12 +1792,16 @@
       const cfg = loadDdpConfig();
       $('__dm_ddp_url__').value = cfg.workerUrl || '';
       $('__dm_ddp_token__').value = cfg.proxyToken != null ? cfg.proxyToken : '';
+      // 同步简繁转换
+      const ch = loadSettings().ddpChConvert;
+      $('__dm_chconvert__').value = (ch != null && ch >= 0 && ch <= 2) ? String(ch) : '1';
       // 同步 AI 配置 + 开关
       const ai = loadAiConfig();
       $('__dm_ai_url__').value = ai.baseUrl || '';
       $('__dm_ai_key__').value = ai.apiKey || '';
       $('__dm_ai_model__').value = ai.model || '';
       $('__dm_ai_switch__').classList.toggle('on', !!ai.enabled);
+      $('__dm_auto_match__').classList.toggle('on', !!ai.autoMatch);
     }
     function closeSettingsModal() {
       settingsModal.classList.remove('open');
@@ -1722,11 +1817,16 @@
       }
     });
     $('__dm_export__').addEventListener('click', () => {
-      const s = loadSettings();
-      const blob = new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' });
+      const data = {
+        settings: loadSettings(),
+        ddp: loadDdpConfig(),
+        ai: loadAiConfig(),
+        matchCache: loadMatchCache(),
+      };
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url; a.download = 'titan-danmaku-settings.json';
+      a.href = url; a.download = 'web-danmaku-plugin-backup.json';
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     });
@@ -1737,8 +1837,13 @@
       reader.onload = () => {
         try {
           const obj = JSON.parse(reader.result);
-          saveSettings(obj);
-          alert('导入成功！刷新页面后生效。');
+          if (obj.settings) saveSettings(obj.settings);
+          if (obj.ddp) saveDdpConfig(obj.ddp);
+          if (obj.ai) saveAiConfig(obj.ai);
+          if (obj.matchCache) saveMatchCache(obj.matchCache);
+          // 兼容旧格式（导出的是裸 settings 对象而不是包装的）
+          if (!obj.settings && !obj.ddp && !obj.ai && !obj.matchCache) saveSettings(obj);
+          alert('导入成功！' + (obj.settings ? '弹幕设置 + 代理 + AI + 匹配缓存已恢复' : '弹幕设置已恢复'));
         } catch (err) { alert('导入失败：' + err.message); }
         e.target.value = '';
       };
@@ -1791,7 +1896,8 @@
     if (window.__titan) window.__titan.setStatus = setStatus;
   }
 
-  function showStatus(msg) {
+  // 右下角状态提示。durationMs=0 表示不自动消失（持续显示直到下次调用覆盖）。
+  function showStatus(msg, durationMs) {
     let el = document.getElementById('__titan_status__');
     if (!el) {
       el = document.createElement('div');
@@ -1802,46 +1908,109 @@
     el.textContent = msg;
     el.style.display = 'block';
     clearTimeout(el.__t);
-    el.__t = setTimeout(() => { el.style.display = 'none'; }, 4000);
+    if (durationMs == null) durationMs = 4000;
+    if (durationMs > 0) el.__t = setTimeout(() => { el.style.display = 'none'; }, durationMs);
   }
 
   // ============= 主流程：MutationObserver 监听 video 出现 =============
   let activeEngine = null;
 
+  // 清理当前活跃引擎 + 所有 UI 元素（换集/PJAX 导航时调用）
+  function cleanupEngine() {
+    if (activeEngine) {
+      try { activeEngine.__titanCleanup(); } catch (e) {}
+      activeEngine = null;
+    }
+    ['__titan_dm_btn__','__titan_dm_menu__','__titan_dm_settings','__titan_dm_modal_mask','__titan_dm_ddp_search','__titan_dm_ddp_mask','__titan_roll_layer__','__titan_cmd_layer__','__titan_status__']
+      .forEach(id => { const e = document.getElementById(id); if (e) e.remove(); });
+  }
+
   function watchVideo() {
     const tryInit = async (video) => {
-      if (activeEngine) {
-        try { activeEngine.__titanCleanup(); } catch (e) {}
-        // 清理所有 UI 元素（换集/重置时避免 DOM 残留）
-        ['__titan_dm_btn__','__titan_dm_menu__','__titan_dm_settings','__titan_dm_modal_mask','__titan_dm_ddp_search','__titan_dm_ddp_mask','__titan_roll_layer__','__titan_cmd_layer__','__titan_status__']
-          .forEach(id => { const e = document.getElementById(id); if (e) e.remove(); });
-        activeEngine = null;
-      }
       if (video.__titanBound) return;
+      // 如果已有活跃引擎（上一个视频），先清理
+      cleanupEngine();
       video.__titanBound = true;
       try {
         const adapter = createAdapter(video);
         const engine = await getEngine(video, adapter);
-        engine.__titanAdapter = adapter;   // 暴露供调试
+        engine.__titanAdapter = adapter;
         activeEngine = engine;
         if (window.__titan) { window.__titan.engine = engine; window.__titan.adapter = adapter; }
-        injectDanmakuControls(engine, video, adapter);  // ← 关键：在 engine 创建后注入
+        injectDanmakuControls(engine, video, adapter);
         await autoLoad(engine, video, adapter);
+        // 全自动载入：同目录弹幕没命中时才走远程 AI 匹配
+        if (!window.__titanLastDmList && engine.__titanAutoMatch) {
+          engine.__titanAutoMatch();
+        }
       } catch (e) {
         console.error('[web-danmaku-plugin] init failed:', e);
         showStatus('Titan 初始化失败: ' + e.message);
       }
     };
 
-    const existing = document.querySelector('video');
-    if (existing) tryInit(existing);
-
-    const obs = new MutationObserver(() => {
+    // 扫描页面所有未绑定的 <video>，逐个 init。
+    // retries：SPA 页面 video 可能是异步创建的（如 ArtPlayer 动态挂载），
+    //   没扫到就每隔 300ms 重试，最多 5 次（1.5s 窗口覆盖异步初始化）。
+    const scanVideos = (retries) => {
+      let found = false;
       document.querySelectorAll('video').forEach(v => {
-        if (!v.__titanBound) tryInit(v);
+        if (!v.__titanBound && (v.currentSrc || v.src)) { tryInit(v); found = true; }
       });
+      if (!found && (retries == null || retries > 0)) {
+        setTimeout(() => scanVideos((retries != null ? retries : 5) - 1), 300);
+      }
+    };
+
+    // 初始扫描（带重试）
+    scanVideos(5);
+
+    // ① body DOM 变化（新 video 插入 + src 属性变化 = 覆盖 OpenList 同元素换源情况）
+    const bodyObs = new MutationObserver((mutations) => {
+      let hasNewVideo = false, hasSrcChange = false;
+      for (const m of mutations) {
+        if (m.type === 'childList' && m.addedNodes.length) hasNewVideo = true;
+        if (m.type === 'attributes' && m.target.tagName === 'VIDEO' && m.attributeName === 'src') {
+          m.target.__titanBound = false; hasSrcChange = true;
+        }
+      }
+      if (hasNewVideo) scanVideos(5);
+      if (hasSrcChange) { cleanupEngine(); setTimeout(() => scanVideos(3), 300); }
     });
-    obs.observe(document.body, { childList: true, subtree: true });
+    bodyObs.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+    // 兜底：video 的 loadstart 事件（覆盖 src 通过属性而非 DOM 属性设置的情况，以及异步播放器初始化）
+    document.addEventListener('loadstart', (e) => {
+      const v = e.target;
+      if (v && v.tagName === 'VIDEO' && !v.__titanBound && (v.currentSrc || v.src)) {
+        setTimeout(() => { if (!v.__titanBound) tryInit(v); }, 100);
+      }
+    }, true);
+
+    // ② PJAX/AJAX 页面导航检测：监听顶层窗口 <title> 文本变化
+    //    标题变化时清理旧引擎 + 清 __titanBound 标记 + 重新扫描。
+    //    iframe 场景下取顶层窗口 title（脚本在 iframe 里运行时 document.title 是 iframe 自己的）。
+    let topWin, topDoc, titleEl;
+    try { topWin = window.top || window; topDoc = (topWin !== window) ? topWin.document : document; }
+    catch (e) { topWin = window; topDoc = document; }
+    let lastTitle = topDoc.title || '';
+    titleEl = topDoc.querySelector('title');
+    if (titleEl) {
+      const titleObs = new MutationObserver(() => {
+        if (topDoc.title !== lastTitle) {
+          lastTitle = topDoc.title;
+          document.querySelectorAll('video').forEach(v => { v.__titanBound = false; });
+          cleanupEngine();
+          setTimeout(() => scanVideos(5), 200);
+        }
+      });
+      titleObs.observe(titleEl, { childList: true, characterData: true, subtree: true });
+    }
+    // ③ history API 导航兜底（popstate，监听顶层窗口。部分 PJAX 框架用）
+    topWin.addEventListener('popstate', () => {
+      document.querySelectorAll('video').forEach(v => { v.__titanBound = false; });
+      cleanupEngine();
+      setTimeout(() => scanVideos(5), 300);
+    });
   }
 
   if (document.readyState === 'loading') {
@@ -1851,5 +2020,5 @@
   }
 
   // 暴露核心函数供 dev/test 端到端验证（生产环境无害，单一命名空间）
-  window.__titan = { injectControls: injectDanmakuControls, getEngine, createAdapter, parseAny, parseDandanplayApi, ddpCommentsToList, filePathFromVideo, loadDdpConfig, saveDdpConfig, ddpSearchEpisodes, ddpGetComment, ddpMatch, loadMatchCache, saveMatchCache, getMatchCache, putMatchCache, clearMatchCache, matchCacheKeyOf, loadAiConfig, saveAiConfig, aiReady, llmExtractFileName, engine: null, adapter: null, setStatus: null };
+  window.__titan = { injectControls: injectDanmakuControls, getEngine, createAdapter, parseAny, parseDandanplayApi, ddpCommentsToList, filePathFromVideo, getPageTitle, loadDdpConfig, saveDdpConfig, ddpSearchEpisodes, ddpGetComment, ddpMatch, loadMatchCache, saveMatchCache, getMatchCache, putMatchCache, clearMatchCache, matchCacheKeyOf, loadAiConfig, saveAiConfig, aiReady, aiEnabled, autoMatchEnabled, llmExtractFileName, pageTitleSnapshot: _PAGE_TITLE_SNAPSHOT, engine: null, adapter: null, setStatus: null };
 })();
