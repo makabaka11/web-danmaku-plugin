@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         今天要来点弹幕吗？
-// @version      1.1.1
+// @version      1.1.2
 // @description  在任意网页视频上加载 B 站网页版同款弹幕引擎（Titan）；OpenList 同目录自动载入 / 本地手动载入 / 弹弹play 在线搜索+智能匹配（支持 AI 增强全自动载入）；
 // @author       Retr0
 // @match        *://*/*
@@ -9,7 +9,9 @@
 // 注：@match *://*/* 匹配所有网页；脚本在任意带 <video> 的页面激活，由 createAdapter 按站点/播放器分流
 // （OpenList:5244/localhost 自动识别为特例；@include 5244 仅为兼容旧油猴版本的显式声明，可省）
 // @require      https://cdn.jsdelivr.net/gh/makabaka11/DFM-Next@master/titan-bundle.js
-// @grant        none
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
 // @run-at       document-end
 // @homepageURL  https://github.com/makabaka11/web-danmaku-plugin
 // @supportURL   https://github.com/makabaka11/web-danmaku-plugin
@@ -569,24 +571,24 @@
     }
   }
 
-  // ============= 持久化（localStorage 存所有设置） =============
+  // ============= 持久化（GM_setValue 跨站存储所有设置，不按 origin 隔离）=============
   const STORAGE_KEY = '__titan_dm_settings__';
   function loadSettings() {
-    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') || {}; } catch (e) { return {}; }
+    try { return JSON.parse(GM_getValue(STORAGE_KEY, '{}')) || {}; } catch (e) { return {}; }
   }
   function saveSettings(obj) {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(obj)); } catch (e) {}
+    try { GM_setValue(STORAGE_KEY, JSON.stringify(obj)); } catch (e) {}
   }
 
   // ============= 主题（暗/亮，跟随页面或手动）=============
-  // 主题存 localStorage：'auto'(默认，跟随页面/系统) | 'light' | 'dark'。
+  // 主题存 GM 跨站存储：'auto'(默认，跟随页面/系统) | 'light' | 'dark'。
   // auto 时：优先取页面 body 背景亮度（很多站点亮色 = 白底）；取不到则退 prefers-color-scheme。
   const THEME_KEY = '__titan_dm_theme__';
   function loadTheme() {
-    try { return localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) { return 'auto'; }
+    try { return GM_getValue(THEME_KEY, 'auto'); } catch (e) { return 'auto'; }
   }
   function saveTheme(t) {
-    try { localStorage.setItem(THEME_KEY, t || 'auto'); } catch (e) {}
+    try { GM_setValue(THEME_KEY, t || 'auto'); } catch (e) {}
   }
   // 判断页面是否偏亮色（body 背景接近白）→ 返回 true=应亮色
   function pageIsLight() {
@@ -624,10 +626,10 @@
   const DEFAULT_DDP_PROXY_TOKEN = '8TUf1AYTwQFjGv';
   const ddpCache = new Map();        // 会话内搜索结果缓存（keyword → SearchEpisodesResponse），降配额
   function loadDdpConfig() {
-    try { return JSON.parse(localStorage.getItem(DDP_KEY) || '{}') || {}; } catch (e) { return {}; }
+    try { return JSON.parse(GM_getValue(DDP_KEY, '{}')) || {}; } catch (e) { return {}; }
   }
   function saveDdpConfig(cfg) {
-    try { localStorage.setItem(DDP_KEY, JSON.stringify(cfg || {})); } catch (e) {}
+    try { GM_setValue(DDP_KEY, JSON.stringify(cfg || {})); } catch (e) {}
   }
   // 取实际生效的 Worker URL：用户在设置里填了就用填的（留空回退默认）；去尾斜杠、自动补协议
   function ddpWorkerUrl() {
@@ -685,14 +687,14 @@
   }
 
   // ============= AI 配置（LLM 清洗文件名，提取番剧名+集号）========================
-  // 安全模型：用户的 LLM key 是个人 key（非项目密钥），存 localStorage。调用经 Worker 的 /llm
+  // 安全模型：用户的 LLM key 是个人 key（非项目密钥），存 GM 跨站存储。调用经 Worker 的 /llm
   //   端点转发（解决浏览器 CORS），key 随请求带给 Worker、不在 Worker 存储。
   const AI_KEY = '__titan_dm_ai__';
   function loadAiConfig() {
-    try { return JSON.parse(localStorage.getItem(AI_KEY) || '{}') || {}; } catch (e) { return {}; }
+    try { return JSON.parse(GM_getValue(AI_KEY, '{}')) || {}; } catch (e) { return {}; }
   }
   function saveAiConfig(cfg) {
-    try { localStorage.setItem(AI_KEY, JSON.stringify(cfg || {})); } catch (e) {}
+    try { GM_setValue(AI_KEY, JSON.stringify(cfg || {})); } catch (e) {}
   }
   // 用户是否在开关里显式开启了 AI 匹配（enabled 字段）。开关开 + 配置齐 → 才显示/走 AI。
   function aiEnabled() { return !!loadAiConfig().enabled; }
@@ -785,10 +787,10 @@
   const MATCH_CACHE_KEY = '__titan_dm_match_cache__';
   const MATCH_CACHE_MAX = 200;          // 最多记 200 条，超出按时间淘汰最旧
   function loadMatchCache() {
-    try { return JSON.parse(localStorage.getItem(MATCH_CACHE_KEY) || '{}') || {}; } catch (e) { return {}; }
+    try { return JSON.parse(GM_getValue(MATCH_CACHE_KEY, '{}')) || {}; } catch (e) { return {}; }
   }
   function saveMatchCache(map) {
-    try { localStorage.setItem(MATCH_CACHE_KEY, JSON.stringify(map || {})); } catch (e) {}
+    try { GM_setValue(MATCH_CACHE_KEY, JSON.stringify(map || {})); } catch (e) {}
   }
   // 视频来源 → 缓存 key（去 query/sign 等不稳定部分，避免 OpenList 的 ?sign= 变化导致命中率下降）
   function matchCacheKeyOf(video) {
@@ -820,7 +822,21 @@
     saveMatchCache(map);
   }
   function clearMatchCache() {
-    try { localStorage.removeItem(MATCH_CACHE_KEY); } catch (e) {}
+    try { GM_deleteValue(MATCH_CACHE_KEY); } catch (e) {}
+  }
+
+  // ============= 刷新恢复（屏蔽/过滤重载不稳 → 刷新页面，但记住位置+弹幕数据）=============
+  // 引擎 reset() 清不干净调度池导致重载重复；改用刷新页面彻底重建引擎。
+  // 刷新前存 {currentTime, rawList, label, episodeId} 到 GM；刷新后 tryInit 检测并恢复。
+  const RESUME_KEY = '__titan_dm_resume__';
+  function loadResume() {
+    try { return JSON.parse(GM_getValue(RESUME_KEY, '{}')) || {}; } catch (e) { return {}; }
+  }
+  function saveResume(data) {
+    try { GM_setValue(RESUME_KEY, JSON.stringify(data || {})); } catch (e) {}
+  }
+  function clearResume() {
+    try { GM_deleteValue(RESUME_KEY); } catch (e) {}
   }
 
 
@@ -875,7 +891,7 @@
 
   // ============= 控件注入：单个按钮 + 弹出菜单（含开关/设置/手动载入） =============
   function injectDanmakuControls(engine, video, adapter) {
-    // 拦截 setSetting：每次调用后自动持久化到 localStorage
+    // 拦截 setSetting：每次调用后自动持久化到 GM 跨站存储
     const _origSetSetting = engine.setSetting.bind(engine);
     engine.setSetting = function (k, v) {
       _origSetSetting(k, v);
@@ -917,6 +933,9 @@
         #__titan_dm_menu__ .row .val{flex:0 0 40px;text-align:right;color:#9cf;font-family:Menlo,monospace;font-size:11px}
         #__titan_dm_menu__ .row .check{flex:1}
         #__titan_dm_menu__ .title{font-size:13px;font-weight:600;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid rgba(255,255,255,0.08);color:#fff;display:flex;align-items:center;justify-content:space-between}
+        #__titan_dm_menu__ .title .ttl{flex:1;min-width:0}
+        #__titan_dm_menu__ .title .dm-close{flex:0 0 auto;margin-left:8px;font-size:18px;line-height:1;color:#888;cursor:pointer;padding:0 2px;transition:color .12s}
+        #__titan_dm_menu__ .title .dm-close:hover{color:#fff}
         #__titan_dm_menu__ .title .hint{font-size:10px;color:#888;font-weight:400;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         #__titan_dm_menu__ .switch,#__titan_dm_settings .switch{position:relative;display:inline-block;width:42px;height:22px;background:#555;border-radius:11px;cursor:pointer;transition:background .2s ease,box-shadow .2s ease;flex:0 0 auto}
         #__titan_dm_menu__ .switch::after,#__titan_dm_settings .switch::after{content:'';position:absolute;left:3px;top:3px;width:16px;height:16px;background:#fff;border-radius:50%;transition:transform .25s cubic-bezier(.4,0,.2,1),left .25s cubic-bezier(.4,0,.2,1)}
@@ -1023,6 +1042,8 @@
         html.__titan_dm_light__ #__titan_dm_menu__ .row input[type=number]{background:#fff;color:#222;border-color:#ccc}
         html.__titan_dm_light__ #__titan_dm_menu__ .row .val{color:#0070a8}
         html.__titan_dm_light__ #__titan_dm_menu__ .title{color:#111;border-color:rgba(0,0,0,0.08)}
+        html.__titan_dm_light__ #__titan_dm_menu__ .title .dm-close{color:#999}
+        html.__titan_dm_light__ #__titan_dm_menu__ .title .dm-close:hover{color:#000}
         html.__titan_dm_light__ #__titan_dm_menu__ .title .hint{color:#888}
         html.__titan_dm_light__ #__titan_dm_menu__ .title-bar{border-color:rgba(0,0,0,0.08)}
         html.__titan_dm_light__ #__titan_dm_menu__ .title-bar .title-text{color:#111}
@@ -1113,7 +1134,7 @@
     menu.innerHTML = `
       <!-- Page 1: 常用设置 -->
       <div class="dm-page active" data-page="1">
-        <div class="title">弹幕设置 <span class="hint dm-status"></span></div>
+        <div class="title"><span class="ttl">弹幕设置 <span class="hint dm-status"></span></span><span class="dm-close" id="__dm_menu_close__" title="关闭">×</span></div>
         <div class="row"><label>显示</label><div id="__dm_switch__" class="switch on"></div></div>
         <div class="sep"></div>
         <div class="row"><label>字号</label><input type=range id=__dm_font__ min=50 max=200 value=100 step=5><span class=val id=__dm_fontv__>1.0×</span></div>
@@ -1178,7 +1199,7 @@
     settingsModal.innerHTML = `
       <div class="modal-title">⚙ 通用设置</div>
       <div class="modal-section">配置管理</div>
-      <div class="row"><label>重置所有</label><button class="btn btn-danger" id="__dm_reset_all__">清空 localStorage</button></div>
+      <div class="row"><label>重置所有</label><button class="btn btn-danger" id="__dm_reset_all__">清空所有存储</button></div>
       <div class="row"><label>导出</label><button class="btn" id="__dm_export__">下载 settings.json</button></div>
       <div class="row"><label>导入</label><button class="btn" id="__dm_import__">选择 JSON 文件</button></div>
       <input type="file" id="__dm_import_file" accept=".json" style="display:none">
@@ -1200,7 +1221,7 @@
       <div class="modal-section">关于</div>
       <div class="about">
         <p><b class="about-brand"> 今天要来点弹幕吗？</b></p>
-        <p>脚本版本：<code id="__dm_ver_script__">1.1.1</code></p>
+        <p>脚本版本：<code id="__dm_ver_script__">1.1.2</code></p>
         <p>引擎：B 站原版 <code>bili-danmaku-x</code>代号[Titan]</p>
         <p>Bundle：<a href="https://cdn.jsdelivr.net/gh/makabaka11/DFM-Next@master/titan-bundle.js" target="_blank">jsDelivr</a>（11.4 MB）</p>
         <p>仓库：<a href="https://github.com/makabaka11/web-danmaku-plugin" target="_blank">github.com/makabaka11/web-danmaku-plugin</a></p>
@@ -1547,13 +1568,21 @@
     // engine.clear() 只清渲染池，**不**清调度池 —— 多次 reload 会导致调度池累积、弹幕重复，
     // 且旧过滤的条目残留在调度池里、toggle off 过滤后"回不到初始值"
     // → 必须 engine.reset() 彻底清空调度池 + engine.seek(curT) 恢复时间
+    // 重载弹幕：engine.reset() 清不干净调度池（重载后弹幕重复/过滤回不去），
+    // 改为刷新页面彻底重建引擎。刷新前把播放位置+弹幕数据存 GM，刷新后自动恢复。
     function reloadDanmakuPreserveTime() {
       const rawList = window.__titanLastDmList;
       if (!rawList || !rawList.length) { setStatus('尚无弹幕可重载（请先载入）'); return; }
-      try {
-        // 复用通用管线：保留当前位置（seekTo=curT）、对齐播放态、不 startPlayback（重过滤而已）
-        applyDanmakuList(rawList, '过滤已应用', { seekTo: video.currentTime || 0 });
-      } catch (e) { setStatus('重载失败: ' + e.message); }
+      // 存恢复数据：位置 + 弹幕原始数据 + 标签（供刷新后载入提示）
+      saveResume({
+        currentTime: video.currentTime || 0,
+        rawList: rawList,
+        label: '重载',
+        ts: Date.now(),
+      });
+      setStatus('⏳ 正在刷新以应用过滤…');
+      // 用 history 滚动位置 hash 触发刷新，保留 SPA 路由（部分站点 pushState 会丢，兜底 location.reload）
+      try { location.reload(); } catch (e) { /* 极少数情况 reload 失败，静默 */ }
     }
 
     // 全局唯一的隐藏 file input
@@ -1815,7 +1844,7 @@
     // 弹窗内按钮
     $('__dm_reset_all__').addEventListener('click', () => {
       if (confirm('确定要清空所有设置？此操作不可撤销。（含弹幕样式设置、弹弹play 代理配置、匹配缓存、AI 配置）')) {
-        [STORAGE_KEY, DDP_KEY, MATCH_CACHE_KEY, AI_KEY].forEach(k => { try { localStorage.removeItem(k); } catch (e) {} });
+        [STORAGE_KEY, DDP_KEY, MATCH_CACHE_KEY, AI_KEY, RESUME_KEY].forEach(k => { try { GM_deleteValue(k); } catch (e) {} });
         alert('已清空。刷新页面后生效。');
       }
     });
@@ -1891,6 +1920,9 @@
       window.removeEventListener('scroll', onWinResize, true);
     }
     btn.addEventListener('click', (e) => { e.stopPropagation(); if (menuOpen) closeMenu(); else openMenu(); });
+    // 菜单标题栏右上角 [×] 关闭按钮（stopPropagation 避免 onDocClick 误判）
+    const mc = $('__dm_menu_close__');
+    if (mc) mc.addEventListener('click', (e) => { e.stopPropagation(); closeMenu(); });
 
     // 初始化按钮可见态
     btn.classList.toggle('off', !engine.config.setting.visible);
@@ -1941,10 +1973,36 @@
         activeEngine = engine;
         if (window.__titan) { window.__titan.engine = engine; window.__titan.adapter = adapter; }
         injectDanmakuControls(engine, video, adapter);
-        await autoLoad(engine, video, adapter);
-        // 全自动载入：同目录弹幕没命中时才走远程 AI 匹配
-        if (!window.__titanLastDmList && engine.__titanAutoMatch) {
-          engine.__titanAutoMatch();
+        // 刷新恢复：屏蔽/过滤重载时存的 rawList + 位置 → 直接恢复，跳过 autoLoad/autoMatch
+        const resume = loadResume();
+        const isFresh = resume.ts && (Date.now() - resume.ts < 60000);  // 60s 内才算有效恢复
+        if (isFresh && resume.rawList && resume.rawList.length) {
+          try {
+            const ct = resume.currentTime || 0;
+            // 内联载入逻辑（applyDanmakuList 在 injectDanmakuControls 闭包内，这里跨闭包调不到，
+            //   直接用 tryInit 闭包的 engine/video + 模块级 filterDmList/startPlayback）
+            const filtered = filterDmList(resume.rawList, engine.config.setting);
+            const rl = document.getElementById('__titan_roll_layer__');
+            if (rl) rl.innerHTML = '';
+            engine.clear(); engine.reset();
+            for (let i = 0; i < filtered.length; i += 150) engine.addList(filtered.slice(i, i + 150));
+            try { engine.seek(ct); } catch (e) {}
+            window.__titanLastDmList = resume.rawList;  // 缓存原始 list（供再次重载）
+            alignPlayback(engine, video);
+            // 恢复视频播放位置：等 loadedmetadata 再设（刷新后视频可能还在加载）
+            const seekVideo = () => { try { video.currentTime = ct; } catch (e) {} };
+            if (video.readyState >= 1) seekVideo();
+            else video.addEventListener('loadedmetadata', seekVideo, { once: true });
+            showStatus('✓ 已恢复弹幕与播放位置（' + ct.toFixed(0) + 's）');
+          } catch (e) { showStatus('⚠️ 恢复失败: ' + e.message); }
+          clearResume();
+        } else {
+          await autoLoad(engine, video, adapter);
+          // 全自动载入：同目录弹幕没命中时才走远程 AI 匹配
+          if (!window.__titanLastDmList && engine.__titanAutoMatch) {
+            engine.__titanAutoMatch();
+          }
+          if (resume.ts) clearResume();  // 清掉过期恢复标记
         }
       } catch (e) {
         console.error('[web-danmaku-plugin] init failed:', e);
@@ -2023,5 +2081,5 @@
   }
 
   // 暴露核心函数供 dev/test 端到端验证（生产环境无害，单一命名空间）
-  window.__titan = { injectControls: injectDanmakuControls, getEngine, createAdapter, parseAny, parseDandanplayApi, ddpCommentsToList, filePathFromVideo, getPageTitle, loadDdpConfig, saveDdpConfig, ddpSearchEpisodes, ddpGetComment, ddpMatch, loadMatchCache, saveMatchCache, getMatchCache, putMatchCache, clearMatchCache, matchCacheKeyOf, loadAiConfig, saveAiConfig, aiReady, aiEnabled, autoMatchEnabled, llmExtractFileName, pageTitleSnapshot: _PAGE_TITLE_SNAPSHOT, engine: null, adapter: null, setStatus: null };
+  window.__titan = { injectControls: injectDanmakuControls, getEngine, createAdapter, parseAny, parseDandanplayApi, ddpCommentsToList, filePathFromVideo, getPageTitle, loadDdpConfig, saveDdpConfig, ddpSearchEpisodes, ddpGetComment, ddpMatch, loadMatchCache, saveMatchCache, getMatchCache, putMatchCache, clearMatchCache, matchCacheKeyOf, loadAiConfig, saveAiConfig, aiReady, aiEnabled, autoMatchEnabled, llmExtractFileName, loadResume, saveResume, clearResume, pageTitleSnapshot: _PAGE_TITLE_SNAPSHOT, engine: null, adapter: null, setStatus: null };
 })();
