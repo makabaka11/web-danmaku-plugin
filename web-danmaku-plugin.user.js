@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         今天要来点弹幕吗？
-// @version      1.1.2
+// @version      1.1.3
 // @description  在任意网页视频上加载 B 站网页版同款弹幕引擎（Titan）；OpenList 同目录自动载入 / 本地手动载入 / 弹弹play 在线搜索+智能匹配（支持 AI 增强全自动载入）；
 // @author       Retr0
 // @match        *://*/*
@@ -739,14 +739,26 @@
         signal: ctrl.signal,
       });
       const txt = await r.text();
-      if (!r.ok) throw new Error((JSON.parse(txt || '{}').errorMessage) || ('HTTP ' + r.status));
-      const j = JSON.parse(txt);
+      if (!r.ok) {
+        // HTTP 错误：优先取 Worker/LLM 的 errorMessage，取不到用原文（可能是 "error code: 1003" 这种纯文本）
+        let msg = '';
+        try { const ej = JSON.parse(txt || '{}'); msg = ej.errorMessage || ej.error?.message || ej.message || ''; } catch (e) {}
+        if (!msg) msg = (txt || '').slice(0, 200) || ('HTTP ' + r.status);
+        throw new Error(msg + '（HTTP ' + r.status + '）');
+      }
+      // LLM 成功响应体：必须是 JSON（choices[].message.content）。非 JSON 时给清晰提示
+      let j;
+      try { j = JSON.parse(txt); } catch (e) {
+        // Worker 透传了 LLM 的非 JSON 响应（如纯文本 "error code: 1003"）
+        throw new Error('LLM 返回非 JSON 响应（' + (txt || '').slice(0, 120) + '），请检查模型/API 地址');
+      }
       const content = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
       if (!content) return null;
       // 解析 LLM 输出（可能带 ```json 包裹或前后杂质）→ 提取 {...}
       const m = content.match(/\{[\s\S]*\}/);
       if (!m) return null;
-      const parsed = JSON.parse(m[0]);
+      let parsed;
+      try { parsed = JSON.parse(m[0]); } catch (e) { return null; }  // LLM 输出的 JSON 格式错误，视为提取失败
       const title = (parsed.title || '').trim();
       if (title.length < 2) return null;
       let episode = (parsed.episode || '').toString().trim();
@@ -1213,15 +1225,15 @@
       <div class="modal-section">AI 配置（智能匹配增强）</div>
       <div class="row"><label>启用 AI</label><div id="__dm_ai_switch__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">开启后「✨ 智能匹配」用 LLM 提取文件名</span></div>
       <div class="row"><label>全自动载入</label><div id="__dm_auto_match__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">打开视频自动匹配标题→单结果自动载入弹幕（零操作）</span></div>
-      <div class="row"><label>API 地址</label><input type="text" id="__dm_ai_url__" placeholder="https://api.deepseek.com/v1" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
+      <div class="row"><label>API 地址</label><input type="text" id="__dm_ai_url__" placeholder="填到 /v1，如 https://ai.retr0.xyz/v1" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
       <div class="row"><label>Key</label><input type="text" id="__dm_ai_key__" placeholder="sk-...（OpenAI 兼容）" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
       <div class="row"><label>模型</label><input type="text" id="__dm_ai_model__" placeholder="deepseek-chat / gpt-4o-mini 等" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
-      <div class="row"><button class="btn btn-primary" id="__dm_ai_save__">保存 AI 配置</button></div>
+      <div class="row"><button class="btn" id="__dm_ai_test__">测试 AI 可用性</button><button class="btn btn-primary" id="__dm_ai_save__">保存 AI 配置</button></div>
       <p class="hint">开启后显示「✨ 智能匹配当前视频」，使用AI提取番剧名+集号再搜索；关闭则该按钮隐藏。</p>
       <div class="modal-section">关于</div>
       <div class="about">
         <p><b class="about-brand"> 今天要来点弹幕吗？</b></p>
-        <p>脚本版本：<code id="__dm_ver_script__">1.1.2</code></p>
+        <p>脚本版本：<code id="__dm_ver_script__">1.1.3</code></p>
         <p>引擎：B 站原版 <code>bili-danmaku-x</code>代号[Titan]</p>
         <p>Bundle：<a href="https://cdn.jsdelivr.net/gh/makabaka11/DFM-Next@master/titan-bundle.js" target="_blank">jsDelivr</a>（11.4 MB）</p>
         <p>仓库：<a href="https://github.com/makabaka11/web-danmaku-plugin" target="_blank">github.com/makabaka11/web-danmaku-plugin</a></p>
@@ -1807,6 +1819,34 @@
       if (!cfg.enabled) alert('AI 配置已保存 ✓\n但「启用 AI」开关未开，「智能匹配」按钮不显示。请先打开开关。');
       else if (aiReady()) alert('AI 配置已保存 ✓ 且可用 ✓\n模型：' + cfg.model + '\n现在「✨ 智能匹配」按钮会显示。');
       else alert('已保存，但 API 地址/模型为空，AI 不可用。请补全后重试。');
+    });
+    // 测试 AI 可用性：用当前输入框值（不必先保存）临时写入并跑一次提取
+    $('__dm_ai_test__').addEventListener('click', async () => {
+      const baseUrl = $('__dm_ai_url__').value.trim();
+      const apiKey = $('__dm_ai_key__').value.trim();
+      const model = $('__dm_ai_model__').value.trim();
+      if (!baseUrl || !model) { alert('请先填写 API 地址和模型'); return; }
+      // 临时写入（不持久化开关，仅让 llmExtractFileName 用到本次配置）
+      const old = loadAiConfig();
+      saveAiConfig({ enabled: true, autoMatch: !!old.autoMatch, baseUrl, apiKey, model });
+      const testBtn = $('__dm_ai_test__');
+      const origTxt = testBtn.textContent;
+      testBtn.disabled = true; testBtn.textContent = '测试中…';
+      try {
+        const ext = await llmExtractFileName('[Nekomoe kissaten&LoliHouse] Chou Kaguya-hime! [WebRip 1080p HEVC-10bit AAC][超时空辉夜姬！]');
+        if (ext && ext.title) {
+          alert('✅ AI 可用！\n模型：' + model + '\n测试提取结果：\n  番剧名：' + ext.title + (ext.episode ? '\n  集号：' + ext.episode : ''));
+        } else {
+          alert('⚠️ AI 已响应但未提取到有效结果，请检查模型是否支持');
+        }
+      } catch (e) {
+        alert('❌ AI 测试失败：' + e.message);
+      } finally {
+        // 还原开关持久化状态（测试时临时开了 enabled，恢复回 old）
+        saveAiConfig({ enabled: !!old.enabled, autoMatch: !!old.autoMatch, baseUrl, apiKey, model });
+        testBtn.disabled = false; testBtn.textContent = origTxt;
+        refreshAiMatchVisibility();
+      }
     });
     // 简繁转换：下拉改即存（弹弹play comment 接口的 chConvert 参数）
     $('__dm_chconvert__').addEventListener('change', () => {
