@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         今天要来点弹幕吗？
-// @version      1.1.3
+// @version      1.1.4
 // @description  在任意网页视频上加载 B 站网页版同款弹幕引擎（Titan）；OpenList 同目录自动载入 / 本地手动载入 / 弹弹play 在线搜索+智能匹配（支持 AI 增强全自动载入）；
 // @author       Retr0
 // @match        *://*/*
@@ -1223,7 +1223,7 @@
       <div class="row"><label>匹配缓存</label><button class="btn btn-danger" id="__dm_ddp_clear_match__">清空已匹配记录</button></div>
       <p class="hint">部署自己的 Worker 见 <code style="font-size:10px">userscript/worker/README.md</code>；匹配过的视频会记住，下次「智能匹配」直接命中，免重复请求。</p>
       <div class="modal-section">AI 配置（智能匹配增强）</div>
-      <div class="row"><label>启用 AI</label><div id="__dm_ai_switch__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">开启后「✨ 智能匹配」用 LLM 提取文件名</span></div>
+      <div class="row"><label>启用 AI</label><div id="_s_dm_ai_switch__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">开启后「✨ 智能匹配」用 LLM 提取文件名</span></div>
       <div class="row"><label>全自动载入</label><div id="__dm_auto_match__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">打开视频自动匹配标题→单结果自动载入弹幕（零操作）</span></div>
       <div class="row"><label>API 地址</label><input type="text" id="__dm_ai_url__" placeholder="填到 /v1，如 https://ai.retr0.xyz/v1" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
       <div class="row"><label>Key</label><input type="text" id="__dm_ai_key__" placeholder="sk-...（OpenAI 兼容）" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
@@ -1233,7 +1233,7 @@
       <div class="modal-section">关于</div>
       <div class="about">
         <p><b class="about-brand"> 今天要来点弹幕吗？</b></p>
-        <p>脚本版本：<code id="__dm_ver_script__">1.1.3</code></p>
+        <p>脚本版本：<code id="__dm_ver_script__">1.1.4</code></p>
         <p>引擎：B 站原版 <code>bili-danmaku-x</code>代号[Titan]</p>
         <p>Bundle：<a href="https://cdn.jsdelivr.net/gh/makabaka11/DFM-Next@master/titan-bundle.js" target="_blank">jsDelivr</a>（11.4 MB）</p>
         <p>仓库：<a href="https://github.com/makabaka11/web-danmaku-plugin" target="_blank">github.com/makabaka11/web-danmaku-plugin</a></p>
@@ -1520,8 +1520,18 @@
         const animes = (res && res.animes) || [];
         const single = animes.length === 1 && animes[0].episodes && animes[0].episodes.length === 1;
         if (!single) {
-          if (animes.length > 1) showStatus('⚠️ 自动匹配：搜索到 ' + animes.length + ' 部作品（' + ext.title + '），无法自动选定，请手动搜索', 8000);
-          else showStatus('⚠️ 自动匹配：未搜到「' + ext.title + (ext.episode ? ' 第' + ext.episode + '集' : '') + '」，请手动搜索', 8000);
+          if (animes.length === 0) {
+            showStatus('⚠️ 自动匹配：未搜到「' + ext.title + (ext.episode ? ' 第' + ext.episode + '集' : '') + '」，请手动搜索', 8000);
+            return;
+          }
+          // 多结果（多部作品，或单作品多集）：自动打开搜索弹窗，列出候选让用户手动选
+          ddpLastResults = res;       // 缓存搜索结果供弹窗复显
+          $('__ddp_kw__').value = ext.title;  // 预填 AI 提取的标题
+          renderDdpAnimes(res);       // 渲染作品列表（用户点作品 → 列剧集 → 点剧集载入）
+          openDdpModal();             // 打开弹窗（会 closeMenu + 聚焦搜索框）
+          // 覆盖 openDdpModal 的默认渲染：上面 renderDdpAnimes 已渲染，openDdpModal 会再渲染一次 ddpLastResults，结果一致无害
+          ddpSetStatus('🤖 AI 命中 ' + animes.length + ' 部作品，请选择');
+          showStatus('🤖 自动匹配到多部作品，已弹出列表请选择', 6000);
           return;
         }
         const a = animes[0]; const e = a.episodes[0];
