@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         今天要来点弹幕吗？
-// @version      1.1.4
+// @version      1.1.5
 // @description  在任意网页视频上加载 B 站网页版同款弹幕引擎（Titan）；OpenList 同目录自动载入 / 本地手动载入 / 弹弹play 在线搜索+智能匹配（支持 AI 增强全自动载入）；
 // @author       Retr0
 // @match        *://*/*
@@ -406,7 +406,7 @@
   // 换通用/原生全屏会丢失，这里统一接管（菜单定位逻辑仍复用 positionMenuGlobal）。
   function getTitanLayers() {
     return [
-      '__titan_roll_layer__', '__titan_cmd_layer__', '__titan_dm_btn__',
+      '__titan_roll_layer__', '__titan_cmd_layer__', '__titan_rotate_layer__', '__titan_dm_btn__',
       '__titan_dm_menu__', '__titan_dm_settings', '__titan_dm_modal_mask', '__titan_status__',
     ].map(id => document.getElementById(id)).filter(Boolean);
   }
@@ -462,13 +462,18 @@
     cmdWrap.id = '__titan_cmd_layer__';
     cmdWrap.style.cssText = 'position:absolute;inset:0;pointer-events:none;';
     artContainer.appendChild(cmdWrap);
+    // rotateDom：引擎内部会访问 dom.rotateDom（旋转弹幕层），缺失会导致引擎内部 null.addEventListener
+    const rotateDom = document.createElement('div');
+    rotateDom.id = '__titan_rotate_layer__';
+    rotateDom.style.cssText = 'position:absolute;inset:0;pointer-events:none;overflow:hidden;';
+    artContainer.appendChild(rotateDom);
 
     // 读取持久化设置（videoSpeed 不持久化 —— 跟随每个视频自身的 playbackRate，否则跨视频会出现错位）
     const { videoSpeed: _vs, ...saved } = loadSettings();
     const engine = new Engine({
       id: 'web-danmaku-plugin',
       container: rollLayer,
-      dom: { insideWrap: cmdWrap },
+      dom: { insideWrap: cmdWrap, rotateDom: rotateDom },
       setting: {
         visible: true, opacity: 0.85,
         fontFamily: "SimHei, 'Microsoft JhengHei', Arial, Helvetica, sans-serif",
@@ -523,6 +528,7 @@
       try { engine.dispose(); } catch (e) {}
       try { rollLayer.remove(); } catch (e) {}
       try { cmdWrap.remove(); } catch (e) {}
+      try { rotateDom.remove(); } catch (e) {}
     };
     return engine;
   }
@@ -1223,7 +1229,7 @@
       <div class="row"><label>匹配缓存</label><button class="btn btn-danger" id="__dm_ddp_clear_match__">清空已匹配记录</button></div>
       <p class="hint">部署自己的 Worker 见 <code style="font-size:10px">userscript/worker/README.md</code>；匹配过的视频会记住，下次「智能匹配」直接命中，免重复请求。</p>
       <div class="modal-section">AI 配置（智能匹配增强）</div>
-      <div class="row"><label>启用 AI</label><div id="_s_dm_ai_switch__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">开启后「✨ 智能匹配」用 LLM 提取文件名</span></div>
+      <div class="row"><label>启用 AI</label><div id="__dm_ai_switch__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">开启后「✨ 智能匹配」用 LLM 提取文件名</span></div>
       <div class="row"><label>全自动载入</label><div id="__dm_auto_match__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">打开视频自动匹配标题→单结果自动载入弹幕（零操作）</span></div>
       <div class="row"><label>API 地址</label><input type="text" id="__dm_ai_url__" placeholder="填到 /v1，如 https://ai.retr0.xyz/v1" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
       <div class="row"><label>Key</label><input type="text" id="__dm_ai_key__" placeholder="sk-...（OpenAI 兼容）" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
@@ -1233,7 +1239,7 @@
       <div class="modal-section">关于</div>
       <div class="about">
         <p><b class="about-brand"> 今天要来点弹幕吗？</b></p>
-        <p>脚本版本：<code id="__dm_ver_script__">1.1.4</code></p>
+        <p>脚本版本：<code id="__dm_ver_script__">1.1.5</code></p>
         <p>引擎：B 站原版 <code>bili-danmaku-x</code>代号[Titan]</p>
         <p>Bundle：<a href="https://cdn.jsdelivr.net/gh/makabaka11/DFM-Next@master/titan-bundle.js" target="_blank">jsDelivr</a>（11.4 MB）</p>
         <p>仓库：<a href="https://github.com/makabaka11/web-danmaku-plugin" target="_blank">github.com/makabaka11/web-danmaku-plugin</a></p>
@@ -1999,6 +2005,7 @@
 
   // ============= 主流程：MutationObserver 监听 video 出现 =============
   let activeEngine = null;
+  let initingVideo = null;  // 初始化锁：标记当前正在 init 的 video，防止并发 tryInit 竞态
 
   // 清理当前活跃引擎 + 所有 UI 元素（换集/PJAX 导航时调用）
   function cleanupEngine() {
@@ -2006,19 +2013,25 @@
       try { activeEngine.__titanCleanup(); } catch (e) {}
       activeEngine = null;
     }
-    ['__titan_dm_btn__','__titan_dm_menu__','__titan_dm_settings','__titan_dm_modal_mask','__titan_dm_ddp_search','__titan_dm_ddp_mask','__titan_roll_layer__','__titan_cmd_layer__','__titan_status__']
+    initingVideo = null;  // 清理时一并释放初始化锁
+    ['__titan_dm_btn__','__titan_dm_menu__','__titan_dm_settings','__titan_dm_modal_mask','__titan_dm_ddp_search','__titan_dm_ddp_mask','__titan_roll_layer__','__titan_cmd_layer__','__titan_rotate_layer__','__titan_status__']
       .forEach(id => { const e = document.getElementById(id); if (e) e.remove(); });
   }
 
   function watchVideo() {
     const tryInit = async (video) => {
       if (video.__titanBound) return;
+      if (initingVideo) return;  // 已有 init 进行中，跳过（避免并发：await getEngine 期间又触发一次）
+      initingVideo = video;
       // 如果已有活跃引擎（上一个视频），先清理
       cleanupEngine();
+      initingVideo = video;  // cleanupEngine 清了锁，重新设回
       video.__titanBound = true;
       try {
         const adapter = createAdapter(video);
         const engine = await getEngine(video, adapter);
+        // await 期间可能被并发清理（cleanupEngine 把 activeEngine 置 null）→ 检查是否仍是本次 init
+        if (initingVideo !== video) { try { engine.__titanCleanup && engine.__titanCleanup(); } catch(e){} return; }
         engine.__titanAdapter = adapter;
         activeEngine = engine;
         if (window.__titan) { window.__titan.engine = engine; window.__titan.adapter = adapter; }
@@ -2056,7 +2069,10 @@
         }
       } catch (e) {
         console.error('[web-danmaku-plugin] init failed:', e);
-        showStatus('Titan 初始化失败: ' + e.message);
+        showStatus('Titan 初始化失败: ' + e.message, 8000);
+        console.error('[web-danmaku-plugin] 堆栈:', e.stack);
+      } finally {
+        if (initingVideo === video) initingVideo = null;  // 释放锁
       }
     };
 
@@ -2066,7 +2082,11 @@
     const scanVideos = (retries) => {
       let found = false;
       document.querySelectorAll('video').forEach(v => {
-        if (!v.__titanBound && (v.currentSrc || v.src)) { tryInit(v); found = true; }
+        if (!v.__titanBound && (v.currentSrc || v.src)) {
+          tryInit(v);
+          // tryInit 真正进入初始化会同步设 __titanBound=true；若被锁挡住返回早退则 __titanBound 仍 false → 继续 retry
+          if (v.__titanBound) found = true;
+        }
       });
       if (!found && (retries == null || retries > 0)) {
         setTimeout(() => scanVideos((retries != null ? retries : 5) - 1), 300);
@@ -2082,7 +2102,10 @@
       for (const m of mutations) {
         if (m.type === 'childList' && m.addedNodes.length) hasNewVideo = true;
         if (m.type === 'attributes' && m.target.tagName === 'VIDEO' && m.attributeName === 'src') {
-          m.target.__titanBound = false; hasSrcChange = true;
+          // 正在初始化中的 video 忽略其 src 变化（播放器初始化常多次设 src，会打断 init）
+          if (initingVideo === m.target) continue;
+          // 只对已绑定的 video 触发换源重载（真实切视频）；未绑定的交给 scanVideos
+          if (m.target.__titanBound) { m.target.__titanBound = false; hasSrcChange = true; }
         }
       }
       if (hasNewVideo) scanVideos(5);
