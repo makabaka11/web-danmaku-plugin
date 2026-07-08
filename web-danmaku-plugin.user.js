@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         今天要来点弹幕吗？
-// @version      1.1.5
+// @version      1.1.6
 // @description  在任意网页视频上加载 B 站网页版同款弹幕引擎（Titan）；OpenList 同目录自动载入 / 本地手动载入 / 弹弹play 在线搜索+智能匹配（支持 AI 增强全自动载入）；
 // @author       Retr0
 // @match        *://*/*
@@ -8,7 +8,8 @@
 // @include      https://*:5244/*
 // 注：@match *://*/* 匹配所有网页；脚本在任意带 <video> 的页面激活，由 createAdapter 按站点/播放器分流
 // （OpenList:5244/localhost 自动识别为特例；@include 5244 仅为兼容旧油猴版本的显式声明，可省）
-// @require      https://cdn.jsdelivr.net/gh/makabaka11/DFM-Next@master/titan-bundle.js
+// @require      https://cdn.jsdelivr.net/gh/makabaka11/web-danmaku-plugin@master/dist/titan-bundle.js
+// @icon         https://www.bilibili.com/favicon.ico
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
@@ -1165,7 +1166,7 @@
         <div class="sep"></div>
         <div class="row"><label>速度同步</label><input type=checkbox class=check id=__dm_sync__ checked></div>
         <div class="row"><label>加粗</label><input type=checkbox class=check id=__dm_bold__ checked></div>
-        <div class="row"><label>描边</label><input type=checkbox class=check id=__dm_border__></div>
+        <div class="row"><label>描边</label><input type=checkbox class=check id=__dm_border__ checked></div>
         <div class="row"><label>防遮挡</label><input type=checkbox class=check id=__dm_shade__></div>
         <div class="sep"></div>
         <button class="btn-more" data-go-page="2">更多设置 →</button>
@@ -1239,7 +1240,7 @@
       <div class="modal-section">关于</div>
       <div class="about">
         <p><b class="about-brand"> 今天要来点弹幕吗？</b></p>
-        <p>脚本版本：<code id="__dm_ver_script__">1.1.5</code></p>
+        <p>脚本版本：<code id="__dm_ver_script__">1.1.6</code></p>
         <p>引擎：B 站原版 <code>bili-danmaku-x</code>代号[Titan]</p>
         <p>Bundle：<a href="https://cdn.jsdelivr.net/gh/makabaka11/DFM-Next@master/titan-bundle.js" target="_blank">jsDelivr</a>（11.4 MB）</p>
         <p>仓库：<a href="https://github.com/makabaka11/web-danmaku-plugin" target="_blank">github.com/makabaka11/web-danmaku-plugin</a></p>
@@ -1659,7 +1660,8 @@
       $('__dm_limit__').value = s.limit || 300;
       $('__dm_sync__').checked = !!s.speedSync;
       $('__dm_bold__').checked = !!s.bold;
-      $('__dm_border__').checked = !!s.fontBorder;
+      // 引擎 fontBorder 语义反转：0=有描边，1=无描边 -> 勾选(描边开)对应 fontBorder=0
+      $('__dm_border__').checked = (s.fontBorder !== 1);
       $('__dm_shade__').checked = !!s.preventShade;
       // Page 2 高级
       $('__dm_fssync__').checked = !!s.fullScreenSync;
@@ -1707,7 +1709,7 @@
     $('__dm_limit__').addEventListener('change', e => { engine.setSetting('limit', +e.target.value || 0); });
     $('__dm_sync__').addEventListener('change', e => { engine.setSetting('speedSync', e.target.checked); });
     $('__dm_bold__').addEventListener('change', e => { engine.setSetting('bold', e.target.checked); });
-    $('__dm_border__').addEventListener('change', e => { engine.setSetting('fontBorder', e.target.checked ? 1 : 0); });
+    $('__dm_border__').addEventListener('change', e => { engine.setSetting('fontBorder', e.target.checked ? 0 : 1); });  // 引擎反转：勾选=0(有描边)
     $('__dm_shade__').addEventListener('change', e => { engine.setSetting('preventShade', e.target.checked); });
     // Page 2 高级
     $('__dm_fssync__').addEventListener('change', e => { engine.setSetting('fullScreenSync', e.target.checked); });
@@ -1849,9 +1851,9 @@
       const origTxt = testBtn.textContent;
       testBtn.disabled = true; testBtn.textContent = '测试中…';
       try {
-        const ext = await llmExtractFileName('[Nekomoe kissaten&LoliHouse] Chou Kaguya-hime! [WebRip 1080p HEVC-10bit AAC][超时空辉夜姬！]');
+        const ext = await llmExtractFileName('[KTXP&VCB-Studio] Plastic Memories [13][Ma10p_1080p][x265_flac].mkv');
         if (ext && ext.title) {
-          alert('✅ AI 可用！\n模型：' + model + '\n测试提取结果：\n  番剧名：' + ext.title + (ext.episode ? '\n  集号：' + ext.episode : ''));
+          alert('✅ AI 可用！\n 测试用例：[KTXP&VCB-Studio] Plastic Memories [13][Ma10p_1080p][x265_flac].mkv \n模型：' + model + '\n测试提取结果：\n  番剧名：' + ext.title + (ext.episode ? '\n  集号：' + ext.episode : ''));
         } else {
           alert('⚠️ AI 已响应但未提取到有效结果，请检查模型是否支持');
         }
