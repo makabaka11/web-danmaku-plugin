@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         今天要来点弹幕吗？
-// @version      1.1.6
+// @version      1.3.0
 // @description  在任意网页视频上加载 B 站网页版同款弹幕引擎（Titan）；OpenList 同目录自动载入 / 本地手动载入 / 弹弹play 在线搜索+智能匹配（支持 AI 增强全自动载入）；
 // @author       Retr0
 // @match        *://*/*
@@ -48,7 +48,7 @@
  *   adapter.getControlsBar() 给出控件栏（ArtPlayer: .art-controls-right 回退链）→ 插入按钮；
  *   返回 null（GenericAdapter）→ 右下角浮层按钮兜底。点击展开下拉菜单，含：
  *     - 弹幕显示开关
- *     - 字号 / 透明度 / 区域 / 速度 / 密度 / 时长 / 上限
+ *     - 字号 / 不透明度 / 区域 / 速度 / 密度 / 时长 / 上限
  *     - 速度同步 / 加粗 / 描边 / 防遮挡
  *     - 「📂 载入本地弹幕」按钮
  *   所有控件直接调 engine.setSetting(key, value)。
@@ -432,9 +432,47 @@
     return () => document.removeEventListener('fullscreenchange', onFs);
   }
 
+  // ============= 引擎 bundle 回退加载 ============
+  // @require 主源（jsdelivr）若因网络/地区拉取失败，运行时按序动态注入备用源。
+  // 注：多个 @require 会被油猴全部加载（非回退、可能重复初始化 webpack），故用运行时回退。
+  const BUNDLE_URLS = [
+    'https://cdn.jsdelivr.net/gh/makabaka11/web-danmaku-plugin@master/dist/titan-bundle.js',
+    'https://gitee.com/ded_retr0/web-danmaku-plugin/raw/master/dist/titan-bundle.js',
+  ];
+  let _bundleEnsured = null;
+  function ensureBundle() {
+    if (_bundleEnsured) return _bundleEnsured;
+    _bundleEnsured = (async () => {
+      if (window.nanoWidgetsJsonp) return true;
+      for (const url of BUNDLE_URLS) {
+        try {
+          await new Promise((res, rej) => {
+            const s = document.createElement('script');
+            s.src = url;
+            s.onload = res;
+            s.onerror = rej;
+            document.head.appendChild(s);
+            setTimeout(rej, 12000);  // 单源 12s 超时
+          });
+          // 等待 bundle 初始化 nanoWidgetsJsonp
+          for (let i = 0; i < 30; i++) {
+            if (window.nanoWidgetsJsonp) return true;
+            await new Promise(r => setTimeout(r, 100));
+          }
+        } catch (e) { /* 该源失败，试下一个 */ }
+      }
+      return false;
+    })();
+    return _bundleEnsured;
+  }
+
   // ============= 拿到 Titan 引擎 =============
   async function getEngine(video, adapter) {
-    if (!window.nanoWidgetsJsonp) throw new Error('titan-bundle 未加载（@require 失败？）');
+    if (!window.nanoWidgetsJsonp) {
+      // @require 主源可能未加载（网络/地区），运行时回退到备用源
+      const ok = await ensureBundle();
+      if (!ok) throw new Error('titan-bundle 加载失败（jsdelivr/gitee 均不可达）');
+    }
     // 等待 webpack runtime 就绪：@require 是异步 fetch + 异步执行，SPA 导航路径下从列表直接点视频时
     // nanoWidgetsJsonp 可能存在但 .push 还没被 webpackJsonpCallback 改写（默认 Array.push 不调 callback）
     // 用"push 一个 fake chunk，callback 是否同步执行"作为就绪信号
@@ -553,11 +591,12 @@
 
   // ============= 自动载入弹幕 =============
   async function autoLoad(engine, video, adapter) {
+    window.__titanLastDmList = null;  // 清陈旧数据（上一个视频留下的），避免误判"已载入"跳过自动匹配
     const hit = await adapter.findDanmaku(video);
     if (!hit) {
       // 仅在有自动载入源的站点（OpenList）提示"同目录无匹配"；通用站点无此概念，静默
-      if (adapter instanceof OpenListArtPlayerAdapter) showStatus('同目录无弹幕文件（菜单 → 手动载入）');
-      return;
+      if (adapter instanceof OpenListArtPlayerAdapter) showStatus('同目录无弹幕文件（菜单 -> 手动载入）');
+      return false;
     }
     try {
       showStatus('载入 ' + hit.name + ' ...');
@@ -570,11 +609,11 @@
       engine.addList(filtered);
       window.__titanLastDmList = rawList;  // 缓存**原始**list（过滤立即生效时重新过滤）
       showStatus('✓ ' + hit.name + ' · ' + filtered.length + ' / ' + rawList.length + ' 条');
-      // 载入成功后同步触发播放：视频若未播则 play()（含 onPlay→engine.play）；被自动播放策略拒时
-      // 让 engine 跟随视频 paused 态，避免"弹幕已在播但视频没播"的错位
       startPlayback(engine, video);
+      return true;
     } catch (e) {
       showStatus('载入失败: ' + e.message);
+      return false;
     }
   }
 
@@ -937,7 +976,26 @@
         #__titan_dm_btn__.__titan_dm_floatbtn__{position:fixed;right:16px;bottom:64px;width:40px;height:40px;border-radius:50%;background:rgba(0,0,0,0.6);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2147483647;box-shadow:0 2px 8px rgba(0,0,0,0.4);transition:transform .12s ease,background .12s ease}
         #__titan_dm_btn__.__titan_dm_floatbtn__:hover{transform:scale(1.08);background:rgba(0,0,0,0.8)}
         /* 菜单：opacity/visibility 切换实现淡入动画，max-height + overflow-y 实现滚动，控件栏下方展开避免顶部溢出 */
-        #__titan_dm_menu__{position:fixed;top:0;left:0;transform:translateY(-6px) scale(0.96);transform-origin:top center;background:linear-gradient(180deg,rgba(30,30,36,0.98),rgba(18,18,22,0.98));border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:14px 16px;min-width:290px;max-width:320px;width:max-content;max-height:min(80vh,560px);overflow-y:auto;overflow-x:hidden;color:#eee;font-size:12px;box-shadow:0 12px 40px rgba(0,0,0,0.6),inset 0 1px 0 rgba(255,255,255,0.06);z-index:2147483647;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;user-select:none;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .18s ease,transform .18s cubic-bezier(.4,0,.2,1),visibility 0s linear .18s;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.2) transparent}
+        #__titan_dm_menu__{position:fixed;top:0;left:0;transform:translateY(-6px) scale(0.96);transform-origin:top center;background:linear-gradient(180deg,rgba(30,30,36,0.98),rgba(18,18,22,0.98));border:1px solid rgba(255,255,255,0.1);border-radius:10px;width:340px;max-width:340px;max-height:min(80vh,560px);display:flex;flex-direction:column;overflow:hidden;color:#eee;font-size:12px;box-shadow:0 12px 40px rgba(0,0,0,0.6),inset 0 1px 0 rgba(255,255,255,0.06);z-index:2147483647;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;user-select:none;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .18s ease,transform .18s cubic-bezier(.4,0,.2,1),visibility 0s linear .18s}
+        /* 横版滑动双面板 */
+        #__titan_dm_menu__ .dm-panel-move{display:flex;flex:1;min-height:0;transition:transform .25s cubic-bezier(.4,0,.2,1)}
+        #__titan_dm_menu__ .dm-panel-move.slide{transform:translateX(-340px)}
+        #__titan_dm_menu__ .dm-panel{width:340px;flex-shrink:0;overflow-y:auto;overflow-x:hidden;padding:14px 16px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.2) transparent}
+        #__titan_dm_menu__ .dm-panel::-webkit-scrollbar{width:6px}
+        #__titan_dm_menu__ .dm-panel::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.2);border-radius:3px}
+        /* 底部固定区（独有功能按钮，不随面板滑动）*/
+        #__titan_dm_menu__ .dm-footer{flex-shrink:0;border-top:1px solid rgba(255,255,255,0.08);padding:10px 16px;display:flex;flex-direction:column;gap:6px}
+        /* 按类型过滤图标块 */
+        #__titan_dm_menu__ .filter-type-group{display:flex;justify-content:space-around;gap:2px}
+        #__titan_dm_menu__ .filter-type{display:flex;flex-direction:column;align-items:center;gap:2px;padding:5px 8px;border:0;border-radius:6px;cursor:pointer;transition:background .12s;position:relative;flex:0 0 auto}
+        #__titan_dm_menu__ .filter-type svg{width:20px;height:20px;fill:#888;transition:fill .12s}
+        #__titan_dm_menu__ .filter-type span{font-size:10px;color:#888;transition:color .12s}
+        #__titan_dm_menu__ .filter-type input{position:absolute;opacity:0;pointer-events:none}
+        #__titan_dm_menu__ .filter-type:hover{background:rgba(255,255,255,0.08)}
+        #__titan_dm_menu__ .filter-type:hover svg{fill:#fff}
+        #__titan_dm_menu__ .filter-type:hover span{color:#fff}
+        #__titan_dm_menu__ .filter-type:has(input:checked) svg,#__titan_dm_menu__ .filter-type:has(input:checked) span{color:#00a1d6;fill:#00a1d6}
+        #__titan_dm_menu__ .filter-type:has(input:checked):hover{background:rgba(0,161,214,0.12)}
         #__titan_dm_menu__.open{opacity:1;visibility:visible;pointer-events:auto;transform:translateY(0) scale(1);transition:opacity .18s ease,transform .18s cubic-bezier(.4,0,.2,1),visibility 0s linear 0s}
         #__titan_dm_menu__::-webkit-scrollbar{width:6px}
         #__titan_dm_menu__::-webkit-scrollbar-track{background:transparent}
@@ -981,9 +1039,44 @@
         #__titan_dm_menu__ input[type=checkbox]{cursor:pointer;accent-color:#00a1d6}
         #__titan_dm_menu__ .btn-save{display:block;width:100%;padding:6px;background:rgba(0,161,214,0.15);color:#9cf;border:1px solid rgba(0,161,214,0.4);border-radius:4px;cursor:pointer;font-size:11px;margin-bottom:6px;transition:all .12s}
         #__titan_dm_menu__ .btn-save:hover{background:rgba(0,161,214,0.25);color:#fff}
+        /* 描边类型单选组（按钮式）+ 弹幕字体下拉 */
+        #__titan_dm_menu__ .radio-group{display:flex;gap:6px}
+        #__titan_dm_menu__ .radio-group input{display:none}
+        #__titan_dm_menu__ .radio-group label{flex:1;text-align:center;padding:6px 4px;border:1px solid rgba(255,255,255,0.15);border-radius:5px;cursor:pointer;font-size:11px;color:#999;transition:all .12s;user-select:none}
+        #__titan_dm_menu__ .radio-group input:checked + label{background:rgba(0,161,214,0.18);border-color:#00a1d6;color:#fff}
+        #__titan_dm_menu__ .radio-group label:hover{border-color:rgba(0,161,214,0.4);color:#fff}
+        #__titan_dm_menu__ select{outline:none}
+        #__titan_dm_menu__ select:focus{border-color:#00a1d6}
         /* 通用设置弹窗（独立浮层） */
         #__titan_dm_modal_mask{position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2147483646;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s ease,visibility 0s linear .2s;backdrop-filter:blur(2px)}
         #__titan_dm_modal_mask.open{opacity:1;visibility:visible;pointer-events:auto;transition:opacity .2s ease,visibility 0s linear 0s}
+        /* 屏蔽词管理窗口 */
+        #__titan_dm_block{position:fixed;top:50%;left:50%;transform:translate(-50%,-48%) scale(0.96);width:min(360px,calc(100vw - 32px));max-height:min(70vh,480px);display:flex;flex-direction:column;background:linear-gradient(180deg,rgba(30,30,36,0.98),rgba(18,18,22,0.98));border:1px solid rgba(255,255,255,0.12);border-radius:12px;color:#eee;font-size:12px;box-shadow:0 20px 60px rgba(0,0,0,0.7);z-index:2147483647;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s ease,transform .2s cubic-bezier(.4,0,.2,1),visibility 0s linear .2s;overflow:hidden}
+        #__titan_dm_block.open{opacity:1;visibility:visible;pointer-events:auto;transform:translate(-50%,-50%) scale(1)}
+        #__titan_dm_block_mask{position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2147483646;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s ease,visibility 0s linear .2s;backdrop-filter:blur(2px)}
+        #__titan_dm_block_mask.open{opacity:1;visibility:visible;pointer-events:auto;transition:opacity .2s ease,visibility 0s linear 0s}
+        #__titan_dm_block .block-head{display:flex;align-items:center;padding:14px 16px 10px;border-bottom:1px solid rgba(255,255,255,0.08)}
+        #__titan_dm_block .block-title{flex:1;font-size:14px;font-weight:600;color:#fff}
+        #__titan_dm_block .block-close{background:transparent;border:0;color:#888;cursor:pointer;font-size:20px;line-height:1}
+        #__titan_dm_block .block-close:hover{color:#fff}
+        #__titan_dm_block .block-add{display:flex;gap:8px;padding:12px 16px}
+        #__titan_dm_block .block-add input{flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:6px;padding:8px 10px;font-size:12px}
+        #__titan_dm_block .block-add input:focus{outline:none;border-color:#00a1d6}
+        #__titan_dm_block .block-add-btn{padding:8px 16px;background:linear-gradient(180deg,#00b4e8,#0098d6);color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500}
+        #__titan_dm_block .block-add-btn:hover{background:linear-gradient(180deg,#1ac5ff,#00a1d6)}
+        #__titan_dm_block .block-tip{padding:0 16px 8px;color:#888;font-size:11px}
+        #__titan_dm_block .block-list{flex:1;overflow-y:auto;padding:4px 12px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.2) transparent}
+        #__titan_dm_block .block-list::-webkit-scrollbar{width:6px}
+        #__titan_dm_block .block-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.2);border-radius:3px}
+        #__titan_dm_block .block-item{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:6px;transition:background .12s}
+        #__titan_dm_block .block-item:hover{background:rgba(255,255,255,0.04)}
+        #__titan_dm_block .block-word{flex:1;min-width:0;color:#ddd;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        #__titan_dm_block .block-del{background:transparent;border:0;color:#888;cursor:pointer;font-size:14px;padding:2px 6px;border-radius:4px;transition:all .12s}
+        #__titan_dm_block .block-del:hover{color:#f88;background:rgba(245,80,80,0.12)}
+        #__titan_dm_block .block-empty{padding:24px;text-align:center;color:#666}
+        #__titan_dm_block .block-footer{padding:10px 16px;border-top:1px solid rgba(255,255,255,0.08)}
+        #__titan_dm_block .block-clear-btn{width:100%;padding:7px;background:rgba(245,80,80,0.1);color:#f88;border:1px solid rgba(245,80,80,0.25);border-radius:6px;cursor:pointer;font-size:11px;transition:all .12s}
+        #__titan_dm_block .block-clear-btn:hover{background:rgba(245,80,80,0.2);color:#faa}
         #__titan_dm_settings{position:fixed;top:50%;left:50%;transform:translate(-50%,-48%) scale(0.96);width:min(360px,calc(100vw - 32px));max-height:min(80vh,560px);overflow-y:auto;background:linear-gradient(180deg,rgba(30,30,36,0.98),rgba(18,18,22,0.98));border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px 22px;color:#eee;font-size:12px;box-shadow:0 20px 60px rgba(0,0,0,0.7),inset 0 1px 0 rgba(255,255,255,0.06);z-index:2147483647;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s ease,transform .2s cubic-bezier(.4,0,.2,1),visibility 0s linear .2s;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.2) transparent}
         #__titan_dm_settings.open{opacity:1;visibility:visible;pointer-events:auto;transform:translate(-50%,-50%) scale(1);transition:opacity .2s ease,transform .2s cubic-bezier(.4,0,.2,1),visibility 0s linear 0s}
         #__titan_dm_settings .modal-title{font-size:14px;font-weight:600;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,0.1);color:#fff}
@@ -1030,12 +1123,12 @@
         #__titan_dm_ddp_search .ddp-anime:hover{background:rgba(0,161,214,0.12)}
         #__titan_dm_ddp_search .ddp-anime img{width:40px;height:56px;object-fit:cover;border-radius:4px;flex-shrink:0;background:#333}
         #__titan_dm_ddp_search .ddp-anime .meta{flex:1;min-width:0}
-        #__titan_dm_ddp_search .ddp-anime .ttl{color:#fff;font-weight:500;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        #__titan_dm_ddp_search .ddp-anime .ttl{color:#fff;font-weight:500;font-size:13px;word-break:break-word;line-height:1.4}
         #__titan_dm_ddp_search .ddp-anime .sub{color:#888;font-size:11px;margin-top:3px}
         #__titan_dm_ddp_search .ddp-ep{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:6px;cursor:pointer;transition:background .12s}
         #__titan_dm_ddp_search .ddp-ep:hover{background:rgba(0,161,214,0.14)}
         #__titan_dm_ddp_search .ddp-ep .no{flex:0 0 34px;color:#9cf;font-family:Menlo,monospace;font-size:11px}
-        #__titan_dm_ddp_search .ddp-ep .ttl{flex:1;color:#ddd;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        #__titan_dm_ddp_search .ddp-ep .ttl{flex:1;min-width:0;color:#ddd;font-size:12px;word-break:break-word;line-height:1.4}
         #__titan_dm_ddp_search .ddp-ep .load{font-size:10px;color:#666}
         #__titan_dm_ddp_search .ddp-status{padding:8px 16px 12px;color:#9cf;font-size:11px;min-height:18px;border-top:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;gap:8px}
         #__titan_dm_ddp_search .ddp-status .ddp-spin{flex:0 0 auto;width:13px;height:13px;border:2px solid rgba(0,161,214,0.25);border-top-color:#00a1d6;border-radius:50%;animation:ddpSpin .7s linear infinite;display:none}
@@ -1078,6 +1171,10 @@
         html.__titan_dm_light__ #__titan_dm_menu__ .btn-back:hover{color:#000}
         html.__titan_dm_light__ #__titan_dm_menu__ .btn-save{color:#0070a8;background:rgba(0,161,214,0.1);border-color:rgba(0,161,214,0.3)}
         html.__titan_dm_light__ #__titan_dm_menu__ .btn-save:hover{color:#000}
+        html.__titan_dm_light__ #__titan_dm_menu__ .radio-group label{color:#666;border-color:rgba(0,0,0,0.15)}
+        html.__titan_dm_light__ #__titan_dm_menu__ .radio-group input:checked + label{background:rgba(0,161,214,0.1);border-color:#00a1d6;color:#000}
+        html.__titan_dm_light__ #__titan_dm_menu__ .radio-group label:hover{color:#000}
+        html.__titan_dm_light__ #__titan_dm_menu__ select{background:#fff;color:#222;border-color:#ccc}
         /* 通用设置弹窗 */
         html.__titan_dm_light__ #__titan_dm_settings{background:linear-gradient(180deg,#fff,#f4f6f8);color:#222;border-color:rgba(0,0,0,0.12);box-shadow:0 20px 60px rgba(0,0,0,0.2),inset 0 1px 0 rgba(255,255,255,0.6)}
         html.__titan_dm_light__ #__titan_dm_settings .modal-title{color:#111;border-color:rgba(0,0,0,0.08)}
@@ -1094,6 +1191,15 @@
         html.__titan_dm_light__ #__titan_dm_settings .hint{color:#999}
         /* 弹弹play 搜索弹窗 */
         html.__titan_dm_light__ #__titan_dm_ddp_search{background:linear-gradient(180deg,#fff,#f4f6f8);color:#222;border-color:rgba(0,0,0,0.12);box-shadow:0 20px 60px rgba(0,0,0,0.2),inset 0 1px 0 rgba(255,255,255,0.6)}
+        /* 屏蔽词窗口亮色 */
+        html.__titan_dm_light__ #__titan_dm_block{background:linear-gradient(180deg,#fff,#f4f6f8);color:#222;border-color:rgba(0,0,0,0.12)}
+        html.__titan_dm_light__ #__titan_dm_block .block-title{color:#111}
+        html.__titan_dm_light__ #__titan_dm_block .block-close{color:#999}
+        html.__titan_dm_light__ #__titan_dm_block .block-close:hover{color:#000}
+        html.__titan_dm_light__ #__titan_dm_block .block-add input{background:#fff;color:#222;border-color:#ccc}
+        html.__titan_dm_light__ #__titan_dm_block .block-word{color:#333}
+        html.__titan_dm_light__ #__titan_dm_block .block-tip{color:#999}
+        html.__titan_dm_light__ #__titan_dm_block .block-empty{color:#999}
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-title{color:#111}
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-close{color:#888}
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-close:hover{color:#000}
@@ -1121,6 +1227,13 @@
         #__titan_dm_menu__ .btn-theme:hover{background:rgba(0,161,214,0.12);color:#fff}
         html.__titan_dm_light__ #__titan_dm_menu__ .btn-theme{color:#0070a8;border-color:rgba(0,0,0,0.15)}
         html.__titan_dm_light__ #__titan_dm_menu__ .btn-theme:hover{color:#000}
+        html.__titan_dm_light__ #__titan_dm_menu__ .dm-footer{border-color:rgba(0,0,0,0.08)}
+        html.__titan_dm_light__ #__titan_dm_menu__ .filter-type svg{fill:#666}
+        html.__titan_dm_light__ #__titan_dm_menu__ .filter-type span{color:#666}
+        html.__titan_dm_light__ #__titan_dm_menu__ .filter-type:hover{background:rgba(0,0,0,0.05)}
+        html.__titan_dm_light__ #__titan_dm_menu__ .filter-type:hover svg{fill:#000}
+        html.__titan_dm_light__ #__titan_dm_menu__ .filter-type:hover span{color:#000}
+        html.__titan_dm_light__ #__titan_dm_menu__ .filter-type:has(input:checked) svg,html.__titan_dm_light__ #__titan_dm_menu__ .filter-type:has(input:checked) span{color:#00a1d6;fill:#00a1d6}
       `;
       document.head.appendChild(css);
     }
@@ -1151,64 +1264,82 @@
     const menu = document.createElement('div');
     menu.id = '__titan_dm_menu__';
     menu.innerHTML = `
-      <!-- Page 1: 常用设置 -->
-      <div class="dm-page active" data-page="1">
-        <div class="title"><span class="ttl">弹幕设置 <span class="hint dm-status"></span></span><span class="dm-close" id="__dm_menu_close__" title="关闭">×</span></div>
-        <div class="row"><label>显示</label><div id="__dm_switch__" class="switch on"></div></div>
-        <div class="sep"></div>
-        <div class="row"><label>字号</label><input type=range id=__dm_font__ min=50 max=200 value=100 step=5><span class=val id=__dm_fontv__>1.0×</span></div>
-        <div class="row"><label>透明度</label><input type=range id=__dm_op__ min=20 max=100 value=85 step=5><span class=val id=__dm_opv__>85%</span></div>
-        <div class="row"><label>区域</label><input type=range id=__dm_area__ min=25 max=100 value=100 step=5><span class=val id=__dm_areav__>满屏</span></div>
-        <div class="row"><label>速度</label><input type=range id=__dm_speed__ min=25 max=300 value=100 step=25><span class=val id=__dm_speedv__>1.0×</span></div>
-        <div class="row"><label>密度</label><input type=range id=__dm_dens__ min=10 max=100 value=100 step=10><span class=val id=__dm_densv__>1.0</span></div>
-        <div class="row"><label>时长</label><input type=range id=__dm_dur__ min=20 max=120 value=45 step=5><span class=val id=__dm_durv__>4.5s</span></div>
-        <div class="row"><label>上限</label><input type=number id=__dm_limit__ value=300 min=0 step=50></div>
-        <div class="sep"></div>
-        <div class="row"><label>速度同步</label><input type=checkbox class=check id=__dm_sync__ checked></div>
-        <div class="row"><label>加粗</label><input type=checkbox class=check id=__dm_bold__ checked></div>
-        <div class="row"><label>描边</label><input type=checkbox class=check id=__dm_border__ checked></div>
-        <div class="row"><label>防遮挡</label><input type=checkbox class=check id=__dm_shade__></div>
-        <div class="sep"></div>
-        <button class="btn-more" data-go-page="2">更多设置 →</button>
-      </div>
-      <!-- Page 2: 高级设置 -->
-      <div class="dm-page" data-page="2">
-        <div class="title-bar">
-          <button class="btn-back" data-go-page="1">← 返回</button>
-          <span class="title-text">高级设置</span>
-          <span class="hint dm-status"></span>
+      <div class="dm-panel-move">
+        <!-- 常用设置 -->
+        <div class="dm-panel">
+          <div class="title"><span class="ttl">弹幕设置 <span class="hint dm-status"></span></span><span class="dm-close" id="__dm_menu_close__" title="关闭">×</span></div>
+          <div class="row"><label>显示</label><div id="__dm_switch__" class="switch on"></div></div>
+          <div class="sep"></div>
+          <div class="row"><label>字号</label><input type=range id=__dm_font__ min=50 max=200 value=100 step=5><span class=val id=__dm_fontv__>1.0×</span></div>
+          <div class="row"><label>不透明度</label><input type=range id=__dm_op__ min=20 max=100 value=85 step=5><span class=val id=__dm_opv__>85%</span></div>
+          <div class="row"><label>区域</label><input type=range id=__dm_area__ min=25 max=100 value=100 step=5><span class=val id=__dm_areav__>满屏</span></div>
+          <div class="row"><label>速度</label><input type=range id=__dm_speed__ min=25 max=300 value=100 step=25><span class=val id=__dm_speedv__>1.0×</span></div>
+          <div class="row"><label>密度</label><input type=range id=__dm_dens__ min=10 max=100 value=100 step=10><span class=val id=__dm_densv__>1.0</span></div>
+          <div class="row"><label>时长</label><input type=range id=__dm_dur__ min=20 max=120 value=45 step=5><span class=val id=__dm_durv__>4.5s</span></div>
+          <div class="row"><label>上限</label><input type=number id=__dm_limit__ value=300 min=0 step=50></div>
+          <div class="sep"></div>
+          <div class="row"><label>速度同步</label><input type=checkbox class=check id=__dm_sync__ checked></div>
+          <div class="row"><label>加粗</label><input type=checkbox class=check id=__dm_bold__ checked></div>
+          <div class="row"><label>防遮挡</label><input type=checkbox class=check id=__dm_shade__></div>
+          <div class="sep"></div>
+          <button class="btn-more" data-go-page="2">更多设置 -></button>
         </div>
-        <div class="row"><label>全屏同步</label><input type=checkbox class=check id=__dm_fssync__></div>
-        <div class="row"><label>顶部偏移</label><input type=number id=__dm_offtop__ value=0 step=1 style="width:60px"></div>
-        <div class="row"><label>底部偏移</label><input type=number id=__dm_offbot__ value=0 step=1 style="width:60px"></div>
-        <div class="row"><label>最大长度</label><input type=number id=__dm_maxlen__ value=50 min=0 step=10 style="width:60px"></div>
-        <div class="sep"></div>
-        <div class="row"><label>屏蔽类型</label>
-          <div class="check-group">
-            <label><input type=checkbox class=check id=__dm_blk_1__>滚动</label>
-            <label><input type=checkbox class=check id=__dm_blk_4__>底部</label>
-            <label><input type=checkbox class=check id=__dm_blk_5__>顶部</label>
-            <label><input type=checkbox class=check id=__dm_blk_6__>逆向</label>
+        <!-- 高级设置 -->
+        <div class="dm-panel">
+          <div class="title-bar">
+            <button class="btn-back" data-go-page="1">← 返回</button>
+            <span class="title-text">高级设置</span>
+            <span class="hint dm-status"></span>
           </div>
+          <div class="row"><label>全屏同步</label><input type=checkbox class=check id=__dm_fssync__></div>
+          <div class="row"><label>顶部偏移</label><input type=number id=__dm_offtop__ value=0 step=1 style="width:60px"></div>
+          <div class="row"><label>底部偏移</label><input type=number id=__dm_offbot__ value=0 step=1 style="width:60px"></div>
+          <div class="row"><label>最大长度</label><input type=number id=__dm_maxlen__ value=50 min=0 step=10 style="width:60px"></div>
+          <div class="sep"></div>
+          <div class="row" style="flex-direction:column;align-items:stretch;gap:6px">
+            <label style="flex:none;color:#aaa;font-size:11px">按类型过滤</label>
+            <div class="filter-type-group">
+              <div class="filter-type" data-blk="1"><svg viewBox="0 0 28 28"><path d="M23 3H5a4 4 0 0 0-4 4v14a4 4 0 0 0 4 4h18a4 4 0 0 0 4-4V7a4 4 0 0 0-4-4zM11 9h6a1 1 0 0 1 0 2h-6a1 1 0 0 1 0-2zm-3 2H6V9h2v2zm4 4h-2v-2h2v2zm9 0h-6a1 1 0 0 1 0-2h6a1 1 0 0 1 0 2z"></path></svg><span>滚动</span><input type=checkbox class=check id=__dm_blk_1__></div>
+              <div class="filter-type" data-blk="4"><svg viewBox="0 0 28 28"><path d="M23 3H5a4 4 0 0 0-4 4v14a4 4 0 0 0 4 4h18a4 4 0 0 0 4-4V7a4 4 0 0 0-4-4zM9 9H7V7h2v2zm4 0h-2V7h2v2zm4 0h-2V7h2v2zm4 0h-2V7h2v2z"></path></svg><span>底部</span><input type=checkbox class=check id=__dm_blk_4__></div>
+              <div class="filter-type" data-blk="5"><svg viewBox="0 0 28 28"><path d="M23 3H5a4 4 0 0 0-4 4v14a4 4 0 0 0 4 4h18a4 4 0 0 0 4-4V7a4 4 0 0 0-4-4zM9 21H7v-2h2v2zm4 0h-2v-2h2v2zm4 0h-2v-2h2v2zm4 0h-2v-2h2v2z"></path></svg><span>顶部</span><input type=checkbox class=check id=__dm_blk_5__></div>
+              <div class="filter-type" data-blk="6"><svg viewBox="0 0 28 28"><path d="M23 3H5a4 4 0 0 0-4 4v14a4 4 0 0 0 4 4h18a4 4 0 0 0 4-4V7a4 4 0 0 0-4-4zM7.849 11.669l.447-.828.492.782.894.184-.536.736.134.966-.85-.321-.804.414.045-.967L7 11.946l.849-.277zm3.352 7.101l-1.43-.506L8.43 19v-1.565L7.357 16.33l1.43-.506.67-1.381.894 1.289 1.475.23-.894 1.289.269 1.519zm7.95-3.9l-2.816-.69-2.458 1.565-.223-2.946-2.145-1.933 2.637-1.151L15.263 7l1.877 2.255 2.86.23-1.52 2.531.671 2.854z"></path></svg><span>逆向</span><input type=checkbox class=check id=__dm_blk_6__></div>
+            </div>
+          </div>
+          <div class="row"><button class="btn-save" id="__dm_open_block__">🚫 屏蔽词管理</button></div>
+          <div class="sep"></div>
+          <div class="row" style="flex-direction:column;align-items:stretch;gap:5px">
+            <label style="flex:none;color:#aaa;font-size:11px">描边类型</label>
+            <div class="radio-group">
+              <input type="radio" name="fontborder" id="__dm_fb0__" value="0" checked><label for="__dm_fb0__">重墨</label>
+              <input type="radio" name="fontborder" id="__dm_fb1__" value="1"><label for="__dm_fb1__">描边</label>
+              <input type="radio" name="fontborder" id="__dm_fb2__" value="2"><label for="__dm_fb2__">45°投影</label>
+            </div>
+          </div>
+          <div class="row"><label>弹幕字体</label><select id="__dm_fontfamily__" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:4px;padding:5px 8px;font-size:12px;cursor:pointer">
+            <option value="SimHei, 'Microsoft JhengHei', Arial, Helvetica, sans-serif">黑体</option>
+            <option value="SimSun, serif">宋体</option>
+            <option value="NSimSun, serif">新宋体</option>
+            <option value="FangSong, serif">仿宋</option>
+            <option value="'Microsoft YaHei', sans-serif">微软雅黑</option>
+            <option value="'Microsoft YaHei UI Light', sans-serif">微软雅黑 Light</option>
+            <option value="'Noto Sans CJK SC DemiLight', sans-serif">Noto Sans DemiLight</option>
+            <option value="'Noto Sans CJK SC Regular', sans-serif">Noto Sans Regular</option>
+          </select></div>
+          <div class="sep"></div>
+          <div class="row"><label>DOM 回收</label><input type=checkbox class=check id=__dm_recdom__ checked></div>
+          <div class="row"><label>模型回收</label><input type=checkbox class=check id=__dm_recmdl__></div>
+          <div class="row"><label>拖拽视频</label><input type=checkbox class=check id=__dm_bindmove__ checked></div>
+          <div class="row"><label>禁止缩小</label><input type=checkbox class=check id=__dm_shrink__ checked></div>
         </div>
-        <div class="row" style="flex-direction:column;align-items:stretch;gap:4px">
-          <label>屏蔽词（每行一个，/正则/ 或子串）</label>
-          <button class="btn-save" id="__dm_save_blocklist__">💾 保存并应用</button>
-          <textarea id=__dm_blocklist__ rows=3 placeholder="如：广告&#10;/^.*剧透.*$/"></textarea>
-        </div>
-        <div class="sep"></div>
-        <div class="row"><label>DOM 回收</label><input type=checkbox class=check id=__dm_recdom__ checked></div>
-        <div class="row"><label>模型回收</label><input type=checkbox class=check id=__dm_recmdl__></div>
-        <div class="row"><label>拖拽视频</label><input type=checkbox class=check id=__dm_bindmove__ checked></div>
-        <div class="row"><label>禁止缩小</label><input type=checkbox class=check id=__dm_shrink__ checked></div>
       </div>
-      <div class="sep"></div>
-      <button class="btn-more" id="__dm_ddp_search__">🌐 弹弹play 搜索弹幕</button>
-      <button class="btn-more" id="__dm_ddp_match__" style="margin-top:6px">✨ 智能匹配当前视频</button>
-      <button class="btn-file" id="__dm_load_file__" style="margin-top:10px">📂 载入本地弹幕文件</button>
-      <button class="btn-theme" id="__dm_toggle_theme__">🌓 切换主题（当前：自动）</button>
-      <button class="btn-more" id="__dm_open_settings__" style="margin-top:6px">⚙ 通用设置</button>
-    `;
+      <div class="dm-footer">
+        <button class="btn-more" id="__dm_ddp_search__">🌐 搜索弹幕</button>
+        <button class="btn-more" id="__dm_ddp_match__">✨ 智能匹配</button>
+        <button class="btn-file" id="__dm_load_file__">📂 载入本地</button>
+        <button class="btn-theme" id="__dm_toggle_theme__">🌓 主题</button>
+        <button class="btn-more" id="__dm_open_settings__">⚙ 通用设置</button>
+      </div>
+   `;
     // 菜单挂到 body（脱开 art-video-player 的 overflow: hidden 裁切），用 position: fixed 手动定位到 btn 旁边
     document.body.appendChild(menu);
 
@@ -1240,7 +1371,7 @@
       <div class="modal-section">关于</div>
       <div class="about">
         <p><b class="about-brand"> 今天要来点弹幕吗？</b></p>
-        <p>脚本版本：<code id="__dm_ver_script__">1.1.6</code></p>
+        <p>脚本版本：<code id="__dm_ver_script__">1.3.0</code></p>
         <p>引擎：B 站原版 <code>bili-danmaku-x</code>代号[Titan]</p>
         <p>Bundle：<a href="https://cdn.jsdelivr.net/gh/makabaka11/DFM-Next@master/titan-bundle.js" target="_blank">jsDelivr</a>（11.4 MB）</p>
         <p>仓库：<a href="https://github.com/makabaka11/web-danmaku-plugin" target="_blank">github.com/makabaka11/web-danmaku-plugin</a></p>
@@ -1254,6 +1385,61 @@
     const settingsMask = document.createElement('div');
     settingsMask.id = '__titan_dm_modal_mask';
     document.body.appendChild(settingsMask);
+
+    // ============= 屏蔽词管理独立窗口 ============
+    const blockModal = document.createElement('div');
+    blockModal.id = '__titan_dm_block';
+    blockModal.innerHTML = `
+      <div class="block-head"><span class="block-title">屏蔽词管理</span><button class="block-close" id="__dm_block_close__">×</button></div>
+      <div class="block-add">
+        <input type="text" id="__dm_block_input__" placeholder="添加屏蔽词，正则以 / 开头 / 结尾">
+        <button class="block-add-btn" id="__dm_block_add__">添加</button>
+      </div>
+      <div class="block-tip">支持子串匹配或 /正则/，共 <span id="__dm_block_count__">0</span> 条</div>
+      <div class="block-list" id="__dm_block_list__"></div>
+      <div class="block-footer"><button class="block-clear-btn" id="__dm_block_clear__">清空全部</button></div>
+    `;
+    document.body.appendChild(blockModal);
+    const blockMask = document.createElement('div');
+    blockMask.id = '__titan_dm_block_mask';
+    document.body.appendChild(blockMask);
+
+    function renderBlockList() {
+      const s = loadSettings();
+      const bl = Array.isArray(s.blockList) ? s.blockList : [];
+      const list = $('__dm_block_list__');
+      $('__dm_block_count__').textContent = bl.length;
+      if (!bl.length) { list.innerHTML = '<div class="block-empty">暂无屏蔽词</div>'; return; }
+      list.innerHTML = bl.map((w, i) => `<div class="block-item"><span class="block-word" title="${escapeHtml(w)}">${escapeHtml(w)}</span><button class="block-del" data-i="${i}">🗑</button></div>`).join('');
+      list.querySelectorAll('.block-del').forEach(b => b.addEventListener('click', () => {
+        const idx = +b.dataset.i;
+        const cur = Array.isArray(loadSettings().blockList) ? loadSettings().blockList : [];
+        cur.splice(idx, 1);
+        engine.setSetting('blockList', cur);
+        renderBlockList();
+        reloadDanmakuPreserveTime();
+      }));
+    }
+    function openBlockModal() { renderBlockList(); blockModal.classList.add('open'); blockMask.classList.add('open'); }
+    function closeBlockModal() { blockModal.classList.remove('open'); blockMask.classList.remove('open'); }
+    $('__dm_block_close__').addEventListener('click', closeBlockModal);
+    blockMask.addEventListener('click', closeBlockModal);
+    $('__dm_block_add__').addEventListener('click', () => {
+      const inp = $('__dm_block_input__');
+      const w = inp.value.trim();
+      if (!w) return;
+      const cur = Array.isArray(loadSettings().blockList) ? loadSettings().blockList : [];
+      if (cur.includes(w)) { inp.value = ''; return; }
+      cur.push(w);
+      engine.setSetting('blockList', cur);
+      inp.value = '';
+      renderBlockList();
+      reloadDanmakuPreserveTime();
+    });
+    $('__dm_block_input__').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('__dm_block_add__').click(); } });
+    $('__dm_block_clear__').addEventListener('click', () => {
+      if (confirm('清空所有屏蔽词？')) { engine.setSetting('blockList', []); renderBlockList(); reloadDanmakuPreserveTime(); }
+    });
 
     // ============= 弹弹play 搜索 / 匹配 UI =============
     // 搜索弹窗：关键词搜作品 → 选作品 → 列剧集 → 点剧集经 Worker 拉弹幕载入引擎
@@ -1660,10 +1846,14 @@
       $('__dm_limit__').value = s.limit || 300;
       $('__dm_sync__').checked = !!s.speedSync;
       $('__dm_bold__').checked = !!s.bold;
-      // 引擎 fontBorder 语义反转：0=有描边，1=无描边 -> 勾选(描边开)对应 fontBorder=0
-      $('__dm_border__').checked = (s.fontBorder !== 1);
       $('__dm_shade__').checked = !!s.preventShade;
       // Page 2 高级
+      // 描边类型单选：fontBorder 0=重墨(默认) / 1=描边 / 2=45°投影
+      const fb = (s.fontBorder == null) ? 0 : s.fontBorder;
+      document.querySelectorAll('input[name=fontborder]').forEach(r => { r.checked = (r.value === String(fb)); });
+      // 弹幕字体
+      const ff = s.fontFamily || "SimHei, 'Microsoft JhengHei', Arial, Helvetica, sans-serif";
+      const ffSel = $('__dm_fontfamily__'); if (ffSel) ffSel.value = ff;
       $('__dm_fssync__').checked = !!s.fullScreenSync;
       $('__dm_offtop__').value = s.offsetTop || 0;
       $('__dm_offbot__').value = s.offsetBottom || 0;
@@ -1677,8 +1867,7 @@
       $('__dm_blk_4__').checked = numBlk.includes(4);
       $('__dm_blk_5__').checked = numBlk.includes(5);
       $('__dm_blk_6__').checked = numBlk.includes(6);
-      const bl = s.blockList || [];
-      $('__dm_blocklist__').value = Array.isArray(bl) ? bl.join('\n') : '';
+      // 屏蔽词列表在独立窗口管理，syncUI 不再设 textarea
       $('__dm_recdom__').checked = !!s.isRecyclingDom;
       $('__dm_recmdl__').checked = !!s.isRecyclingModel;
       $('__dm_bindmove__').checked = !!s.canBindMove;
@@ -1709,38 +1898,36 @@
     $('__dm_limit__').addEventListener('change', e => { engine.setSetting('limit', +e.target.value || 0); });
     $('__dm_sync__').addEventListener('change', e => { engine.setSetting('speedSync', e.target.checked); });
     $('__dm_bold__').addEventListener('change', e => { engine.setSetting('bold', e.target.checked); });
-    $('__dm_border__').addEventListener('change', e => { engine.setSetting('fontBorder', e.target.checked ? 0 : 1); });  // 引擎反转：勾选=0(有描边)
     $('__dm_shade__').addEventListener('change', e => { engine.setSetting('preventShade', e.target.checked); });
+    // 描边类型单选组：0=重墨 1=描边 2=45°投影
+    document.querySelectorAll('input[name=fontborder]').forEach(r => {
+      r.addEventListener('change', e => { if (e.target.checked) engine.setSetting('fontBorder', +e.target.value); });
+    });
+    // 弹幕字体
+    $('__dm_fontfamily__').addEventListener('change', e => { engine.setSetting('fontFamily', e.target.value); });
     // Page 2 高级
     $('__dm_fssync__').addEventListener('change', e => { engine.setSetting('fullScreenSync', e.target.checked); });
     $('__dm_offtop__').addEventListener('change', e => { engine.setSetting('offsetTop', +e.target.value || 0); });
     $('__dm_offbot__').addEventListener('change', e => { engine.setSetting('offsetBottom', +e.target.value || 0); });
     $('__dm_maxlen__').addEventListener('change', e => { engine.setSetting('maxLength', +e.target.value || 0); });
-    // 屏蔽类型的 change 在下方统一绑定（带 reloadDanmakuPreserveTime）
-    $('__dm_blocklist__').addEventListener('input', e => {
-      // 实时解析（不持久化）让 filter 看到最新词，但需点保存才重载
-      const arr = e.target.value.split('\n').map(s => s.trim()).filter(Boolean);
-      engine.config.setting.blockList = arr;  // 直接写（不让 setSetting 持久化半成品）
+    // 屏蔽词管理：打开独立窗口
+    $('__dm_open_block__').addEventListener('click', () => { closeMenu(); openBlockModal(); });
+    // 屏蔽类型图标块：点 div 切换内部 checkbox 并触发 change（checkbox 视觉隐藏，靠 :has 高亮）
+    menu.querySelectorAll('.filter-type').forEach(ft => {
+      ft.addEventListener('click', (e) => {
+        if (e.target.tagName === 'INPUT') return;
+        const cb = ft.querySelector('input[type=checkbox]');
+        if (cb) { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change', { bubbles: true })); }
+      });
     });
-    $('__dm_save_blocklist__').addEventListener('click', () => {
-      const arr = $('__dm_blocklist__').value.split('\n').map(s => s.trim()).filter(Boolean);
-      engine.setSetting('blockList', arr);  // 持久化 + 触发重载
-      reloadDanmakuPreserveTime();
-    });
-    // 屏蔽类型 change：自动立即重载（用户要求）
-    // 注意：原版 Titan 引擎的 noDanmakuXTypes 接受**字符串类别**（"common"/"interact"/"special"），
-    // 但源码证实 mode 1/4/5/6（滚动/底/顶/逆向）**全归 "common"**（M[g] 都为 true）—— 勾任何一个就屏蔽全部 common
-    // → 放弃 setSetting('noDanmakuXTypes')，**完全**用 fn.filter 数字 mode 精确过滤
+    // 屏蔽类型 change：自动立即重载（__numBlk 按 mode 数字精确过滤）
     ['blk_1','blk_4','blk_5','blk_6'].forEach(k => $('__dm_' + k + '__').addEventListener('change', () => {
-      // 勾选 = 屏蔽
       const numBlk = [];
-      if ($('__dm_blk_1__').checked) numBlk.push(1);  // 滚动
-      if ($('__dm_blk_4__').checked) numBlk.push(4);  // 底
-      if ($('__dm_blk_5__').checked) numBlk.push(5);  // 顶
-      if ($('__dm_blk_6__').checked) numBlk.push(6);  // 逆向
-      // fn.filter 通过 __numBlk 字段查（精确按 mode 数字匹配）
+      if ($('__dm_blk_1__').checked) numBlk.push(1);
+      if ($('__dm_blk_4__').checked) numBlk.push(4);
+      if ($('__dm_blk_5__').checked) numBlk.push(5);
+      if ($('__dm_blk_6__').checked) numBlk.push(6);
       engine.config.setting.__numBlk = numBlk;
-      // 显式设空 noDanmakuXTypes（避免之前 ["common"] 误屏蔽全部）
       engine.setSetting('noDanmakuXTypes', []);
       reloadDanmakuPreserveTime();
     }));
@@ -1748,12 +1935,13 @@
     $('__dm_recmdl__').addEventListener('change', e => { engine.setSetting('isRecyclingModel', e.target.checked); });
     $('__dm_bindmove__').addEventListener('change', e => { engine.setSetting('canBindMove', e.target.checked); });
     $('__dm_shrink__').addEventListener('change', e => { engine.setSetting('forbidShrinkState', e.target.checked); });
-    // 页面切换
+    // 面板切换（横版滑动：data-go-page=2 滑到高级，=1 滑回常用）
     menu.addEventListener('click', e => {
       const btn = e.target.closest('[data-go-page]');
       if (!btn) return;
       const p = btn.getAttribute('data-go-page');
-      menu.querySelectorAll('.dm-page').forEach(d => d.classList.toggle('active', d.dataset.page === p));
+      const move = menu.querySelector('.dm-panel-move');
+      if (move) move.classList.toggle('slide', p === '2');
     });
     $('__dm_load_file__').addEventListener('click', () => $('__titan_file_input__').click());
     $('__dm_open_settings__').addEventListener('click', () => {
@@ -2016,7 +2204,7 @@
       activeEngine = null;
     }
     initingVideo = null;  // 清理时一并释放初始化锁
-    ['__titan_dm_btn__','__titan_dm_menu__','__titan_dm_settings','__titan_dm_modal_mask','__titan_dm_ddp_search','__titan_dm_ddp_mask','__titan_roll_layer__','__titan_cmd_layer__','__titan_rotate_layer__','__titan_status__']
+    ['__titan_dm_btn__','__titan_dm_menu__','__titan_dm_settings','__titan_dm_modal_mask','__titan_dm_block','__titan_dm_block_mask','__titan_dm_ddp_search','__titan_dm_ddp_mask','__titan_roll_layer__','__titan_cmd_layer__','__titan_rotate_layer__','__titan_status__']
       .forEach(id => { const e = document.getElementById(id); if (e) e.remove(); });
   }
 
@@ -2062,9 +2250,9 @@
           } catch (e) { showStatus('⚠️ 恢复失败: ' + e.message); }
           clearResume();
         } else {
-          await autoLoad(engine, video, adapter);
-          // 全自动载入：同目录弹幕没命中时才走远程 AI 匹配
-          if (!window.__titanLastDmList && engine.__titanAutoMatch) {
+          const dmLoaded = await autoLoad(engine, video, adapter);
+          // 全自动载入：同目录弹幕没命中（autoLoad 返回 false）时才走远程 AI 匹配
+          if (!dmLoaded && engine.__titanAutoMatch) {
             engine.__titanAutoMatch();
           }
           if (resume.ts) clearResume();  // 清掉过期恢复标记
