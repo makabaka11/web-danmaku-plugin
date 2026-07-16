@@ -16,3 +16,11 @@ DDP_AUTH_MODE = "both"      # both | credential | signature
 #   npx wrangler secret put DDP_APP_SECRET
 #   npx wrangler secret put PROXY_TOKEN      # 可选，防滥用
 # 值见 userscript/调用信息.txt.rtf
+
+# D1 数据库：缓存「番剧名 -> animeId」(永久)。命中后用 animeId 调 bangumi/{id} 取最新 episodes，
+# 省掉 search 调用、避开 search 滥用检测。未配置 DB 时 Worker 自动回退原行为(无缓存)。
+# 创建：npx wrangler d1 create dandanplay-cache  -> 把输出的 database_id 填到下面 database_id
+[[d1_databases]]
+binding = "DB"
+database_name = "dandanplay-cache"
+database_id = "8388c542-083b-4b43-b4ef-b36f6de5c464"   # 部署前填入 `npx wrangler d1 create dandanplay-cache` 的输出

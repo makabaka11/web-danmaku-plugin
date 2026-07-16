@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         今天要来点弹幕吗？
-// @version      1.2.0
+// @version      1.2.1
 // @description  在任意网页视频上加载 B 站网页版同款弹幕引擎（Titan）；OpenList 同目录自动载入 / 本地手动载入 / 弹弹play 在线搜索+智能匹配（支持 AI 增强全自动载入）；
 // @author       Retr0
 // @match        *://*/*
@@ -13,6 +13,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
+// @grant        GM_registerMenuCommand
 // @run-at       document-end
 // @homepageURL  https://github.com/makabaka11/web-danmaku-plugin
 // @supportURL   https://github.com/makabaka11/web-danmaku-plugin
@@ -756,9 +757,75 @@
   // prompt 要求只返回 JSON。失败返回 null（调用方回退到原 fileName 匹配）。
   const LLM_TIMEOUT_MS = 20000;
   const LLM_SYSTEM_PROMPT =
-    '你是一个动漫视频文件名解析助手。输入一个视频文件名（可能含字幕组、分辨率、编码、集号等杂质）。' +
-    '请提取出干净的番剧标题(title)和集号(episode，纯数字字符串，无"第/话/集"等字；剧场版填movie)。' +
-    '只输出 JSON，不要解释，格式：{"title":"...","episode":"..."}。title 用原始语言（中文/日文/英文任一，取文件名里的主体名）。';
+    '你是一个动漫视频文件名/网页标题解析助手。输入文本可能含字幕组、分辨率、编码、集号等杂质。' +
+    '请提取干净的番剧标题(title)和集号(episode)。\n' +
+    'episode 规则（务必遵守，匹配错误会加载错弹幕）：\n' +
+    '- TV 正片：纯数字，去前导0。如 "1"、"12"；"01"->"1"。\n' +
+    '- 剧场版/电影：填 "movie"。\n' +
+    '- 特殊篇（SP/OVA/OAD/OP/ED 等）：保留类型前缀+数字，去前导0。如 "SP1"、"SP2"、"OVA1"、"OAD1"；"OVA01"->"OVA1"。无数字时只填前缀，如 "SP"、"OVA"。\n' +
+    '- 关键：SP1/OVA1/OAD1 等是「特殊篇」而不是「第1集」，绝不能去掉前缀变成 "1"。\n' +
+    '只输出 JSON，不要解释：{"title":"...","episode":"..."}。title 用原始语言（中文/日文/英文，取主体名）。';
+
+  // ============= 集号解析与特殊篇匹配 =============
+  // 规范化 LLM 返回的 episode：前缀大写、数字去前导0；保留特殊篇前缀（SP/OVA/OAD…），不再粗暴去非数字
+  function normalizeEpisode(ep) {
+    ep = (ep == null ? '' : ep).toString().trim();
+    if (!ep) return '';
+    if (/movie/i.test(ep)) return 'movie';
+    // 字母前缀（特殊篇）+ 可选分隔 + 可选数字
+    let m = ep.match(/^([A-Za-z]+)[^0-9]*0*(\d*)$/);
+    if (m && m[1] && !/^\d+$/.test(ep)) {
+      return m[1].toUpperCase() + (m[2] !== '' ? String(parseInt(m[2], 10)) : '');
+    }
+    // 纯数字
+    m = ep.match(/^0*(\d+)$/);
+    if (m) return String(parseInt(m[1], 10));
+    return ep;
+  }
+  // 把规范化 episode 解析为 {kind, prefix, num}：kind='main'|'movie'|'special'|'unknown'
+  function parseWantEpisode(ep) {
+    ep = (ep || '').trim();
+    if (!ep) return { kind: 'unknown' };
+    if (ep === 'movie') return { kind: 'movie' };
+    const m = ep.match(/^([A-Za-z]+)(\d*)$/);
+    if (m && m[1]) {
+      let prefix = m[1].toUpperCase();
+      if (prefix === 'SPECIAL' || prefix === 'S') prefix = 'SP';
+      return { kind: 'special', prefix, num: m[2] ? parseInt(m[2], 10) : null };
+    }
+    const n = ep.match(/^(\d+)$/);
+    if (n) return { kind: 'main', num: parseInt(n[1], 10) };
+    return { kind: 'unknown', text: ep };
+  }
+  // 在某作品的剧集列表里按特殊篇定位最匹配的一集；返回 {ep, score} 或 null
+  // score: 100=类型+集号完全匹配；50=仅类型匹配（未指定集号）；10=类型匹配但标题无数字
+  function pickSpecialEpisode(episodes, want) {
+    if (!episodes || !episodes.length || !want || want.kind !== 'special') return null;
+    const prefix = want.prefix;
+    const num = want.num;
+    const isSp = (prefix === 'SP');
+    const scored = [];
+    for (const ep of episodes) {
+      const title = ep.episodeTitle || '';
+      const up = title.toUpperCase();
+      if (/剧场版|劇場版|MOVIE/.test(up)) continue;  // 跳过剧场版
+      // 类型匹配（SP 兼容 dandanplay 的 S1/S2 命名，以及 SPECIAL/特别篇/番外/特典）
+      let typeOk = false;
+      if (isSp) typeOk = /(^|[^A-Z])SP([^A-Z]|$)/.test(up) || /(^|[^A-Z])S\d+([^A-Z]|$)/.test(up) || up.includes('SPECIAL') || /特别篇|特別篇|番外|特典/.test(title);
+      else typeOk = up.includes(prefix);
+      if (!typeOk) continue;
+      // 标题里的数字
+      const nm = title.match(/(\d+)/);
+      const epNum = nm ? parseInt(nm[1], 10) : null;
+      if (num != null && epNum === num) scored.push({ ep, score: 100 });
+      else if (num == null) scored.push({ ep, score: 50 });
+      else if (epNum == null) scored.push({ ep, score: 10 });
+      // 类型匹配但集号不同 -> 不选
+    }
+    if (!scored.length) return null;
+    scored.sort((a, b) => b.score - a.score);
+    return scored[0];
+  }
   async function llmExtractFileName(fileName) {
     const cfg = loadAiConfig();
     if (!aiReady()) return null;
@@ -807,10 +874,8 @@
       try { parsed = JSON.parse(m[0]); } catch (e) { return null; }  // LLM 输出的 JSON 格式错误，视为提取失败
       const title = (parsed.title || '').trim();
       if (title.length < 2) return null;
-      let episode = (parsed.episode || '').toString().trim();
-      if (/movie/i.test(episode)) episode = '';
-      episode = episode.replace(/[^\d]/g, '');  // 只留数字
-      return { title, episode: episode || '' };
+      const episode = normalizeEpisode(parsed.episode || '');  // 保留特殊篇前缀（SP1/OVA1…），不再去非数字
+      return { title, episode };
     } catch (e) {
       throw new Error('AI 提取失败: ' + e.message);
     } finally {
@@ -897,6 +962,94 @@
     try { GM_deleteValue(RESUME_KEY); } catch (e) {}
   }
 
+  // ============= 全自动载入黑名单 =============
+  // 部分网页不需要全自动载入（AI 提取标题搜番剧），按 URL 规则屏蔽。
+  // 开关开启后：① 通用设置「配置管理」区显示「管理黑名单」入口；② 新站点首次触发全自动载入前
+  //   弹窗询问是否加入；③ 命中规则的站点整体不注入弹幕（不显示图标/消息，watchVideo 直接返回）。
+  const BLACKLIST_KEY = '__titan_dm_blacklist__';
+  function loadBlacklist() {
+    try {
+      const o = JSON.parse(GM_getValue(BLACKLIST_KEY, '{}')) || {};
+      if (!Array.isArray(o.patterns)) o.patterns = [];
+      return o;
+    } catch (e) { return { enabled: false, patterns: [] }; }
+  }
+  function saveBlacklist(o) {
+    try { GM_setValue(BLACKLIST_KEY, JSON.stringify(o || { enabled: false, patterns: [] })); } catch (e) {}
+  }
+  function blacklistEnabled() { return !!loadBlacklist().enabled; }
+  // 追加规则（去重）
+  function addBlacklistPatterns(patterns) {
+    if (!patterns || !patterns.length) return;
+    const cfg = loadBlacklist();
+    const set = new Set(cfg.patterns || []);
+    patterns.forEach(p => { if (p) set.add(p); });
+    cfg.patterns = Array.from(set);
+    saveBlacklist(cfg);
+  }
+
+  // 已访问站点（按根域名记），用于「新站点」判定。仅黑名单开关开启后才记录/查询，
+  // 故开关关闭期间访问的站点在首次开启后仍会被视作新站点（符合「从未打开过」的发现语义）。
+  const SEEN_SITES_KEY = '__titan_dm_seen_sites__';
+  function loadSeenSites() {
+    try { const a = JSON.parse(GM_getValue(SEEN_SITES_KEY, '[]')); return Array.isArray(a) ? a : []; }
+    catch (e) { return []; }
+  }
+  function saveSeenSites(arr) {
+    try { GM_setValue(SEEN_SITES_KEY, JSON.stringify(arr || [])); } catch (e) {}
+  }
+  function markSiteSeen(root) {
+    if (!root) return;
+    const a = loadSeenSites();
+    if (!a.includes(root)) { a.push(root); saveSeenSites(a); }
+  }
+
+  // 根域名（eTLD+1 近似）：无公共后缀表，用常见两段 TLD 启发表兜底。
+  //   www.bilibili.com -> bilibili.com；a.b.example.co.uk -> example.co.uk；
+  //   IP / localhost / IPv6 原样返回。
+  const TWO_PART_TLDS = new Set([
+    'co.uk','org.uk','ac.uk','gov.uk','co.jp','ne.jp','or.jp','ac.jp','com.cn','net.cn','org.cn','gov.cn','edu.cn',
+    'com.hk','com.tw','com.au','net.au','org.au','co.nz','co.kr','com.br','com.mx','com.ar','co.in','org.in','net.in',
+    'com.sg','com.my','com.ph','com.vn','com.tr','co.za','com.ua','com.pl','co.id'
+  ]);
+  function getRootDomain(hostname) {
+    if (!hostname) return '';
+    hostname = hostname.toLowerCase();
+    if (hostname === 'localhost' || /^\d+\.\d+\.\d+\.\d+$/.test(hostname) || /^[0-9a-f:]+$/i.test(hostname)) return hostname;
+    const parts = hostname.split('.');
+    if (parts.length <= 2) return hostname;
+    const last2 = parts.slice(-2).join('.');
+    const last3 = parts.slice(-3).join('.');
+    if (TWO_PART_TLDS.has(last2) && parts.length >= 3) return last3;
+    if (TWO_PART_TLDS.has(last3) && parts.length >= 4) return parts.slice(-4).join('.');
+    return last2;
+  }
+
+  // URL 规则 -> 正则：* 转 .*，其余字符转义；用 ^...$ 锚定整串。
+  function patternToRegex(pattern) {
+    if (!pattern) return null;
+    const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+    try { return new RegExp('^(?:' + escaped + ')$'); } catch (e) { return null; }
+  }
+  // 命中判定：同时拿 location.href 和 hostname 试，兼容 *://*.x.com/*（URL 写法）与 *.x.com（域名写法）。
+  function isUrlBlacklisted(href, hostname) {
+    const bl = loadBlacklist();
+    if (!bl.enabled || !bl.patterns || !bl.patterns.length) return false;
+    const h = href || location.href;
+    const host = hostname || location.hostname;
+    for (const p of bl.patterns) {
+      const re = patternToRegex(p);
+      if (!re) continue;
+      if (re.test(h) || re.test(host)) return true;
+    }
+    return false;
+  }
+  function isNewSite() {
+    const root = getRootDomain(location.hostname);
+    if (!root) return false;
+    return !loadSeenSites().includes(root);
+  }
+
 
   // ============= 弹幕过滤（脚本自己处理，不依赖引擎 fn.filter） =============
   // 输入：完整弹幕 list + engine.config.setting（通过参数传入，不依赖闭包 engine 变量——
@@ -948,21 +1101,8 @@
   // 全屏 re-parent 已由 getEngine 内的 attachFullscreenReparenter 统一接管（渲染层 + 浮层 UI + 菜单重定位）
 
   // ============= 控件注入：单个按钮 + 弹出菜单（含开关/设置/手动载入） =============
-  function injectDanmakuControls(engine, video, adapter) {
-    // 拦截 setSetting：每次调用后自动持久化到 GM 跨站存储
-    const _origSetSetting = engine.setSetting.bind(engine);
-    engine.setSetting = function (k, v) {
-      _origSetSetting(k, v);
-      saveSettings(engine.config.setting);
-    };
-
-    // 控件栏由 adapter 决定（ArtPlayer: .art-controls-right 回退链；通用: null → 浮层按钮兜底）
-    const insertTo = adapter.getControlsBar();
-    if (insertTo) console.log('[web-danmaku-plugin] 控件注入到: ' + insertTo.className);
-    else console.log('[web-danmaku-plugin] 无控件栏，使用浮层按钮');
-
-    // 注入 CSS（一次性）。按钮样式完全复用 ArtPlayer 自带 .art-control（位置/悬浮/高亮都一致），
-    // 这里只写菜单和 .off 状态。
+  // ============= 样式注入（引擎无关，脚本启动即注入；任意页面通用设置 UI 都依赖它）=============
+  function injectCSS() {
     if (!document.getElementById('__titan_dm_css__')) {
       const css = document.createElement('style');
       css.id = '__titan_dm_css__';
@@ -1014,6 +1154,11 @@
         #__titan_dm_menu__ .title .dm-close{flex:0 0 auto;margin-left:8px;font-size:18px;line-height:1;color:#888;cursor:pointer;padding:0 2px;transition:color .12s}
         #__titan_dm_menu__ .title .dm-close:hover{color:#fff}
         #__titan_dm_menu__ .title .hint{font-size:10px;color:#888;font-weight:400;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        /* 标题下方的弹幕信息行（持久显示 + 保存弹幕入口；换行不撑宽菜单） */
+        #__titan_dm_menu__ .dm-info{margin:-4px 0 8px;font-size:11px;line-height:1.5;word-break:break-all;color:#9cf}
+        #__titan_dm_menu__ .dm-info .dm-save{font-size:10px;color:#888;text-decoration:underline;cursor:pointer;margin-left:6px;white-space:nowrap}
+        #__titan_dm_menu__ .dm-info .dm-save:hover{color:#9cf}
+        #__titan_dm_menu__ .dm-info .dm-save[hidden]{display:none}
         #__titan_dm_menu__ .switch,#__titan_dm_settings .switch{position:relative;display:inline-block;width:42px;height:22px;background:#555;border-radius:11px;cursor:pointer;transition:background .2s ease,box-shadow .2s ease;flex:0 0 auto}
         #__titan_dm_menu__ .switch::after,#__titan_dm_settings .switch::after{content:'';position:absolute;left:3px;top:3px;width:16px;height:16px;background:#fff;border-radius:50%;transition:transform .25s cubic-bezier(.4,0,.2,1),left .25s cubic-bezier(.4,0,.2,1)}
         #__titan_dm_menu__ .switch.on,#__titan_dm_settings .switch.on{background:#00c6ff;box-shadow:0 0 10px rgba(0,198,255,0.45)}
@@ -1048,8 +1193,10 @@
         #__titan_dm_menu__ select{outline:none}
         #__titan_dm_menu__ select:focus{border-color:#00a1d6}
         /* 通用设置弹窗（独立浮层） */
-        #__titan_dm_modal_mask{position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2147483646;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s ease,visibility 0s linear .2s;backdrop-filter:blur(2px)}
-        #__titan_dm_modal_mask.open{opacity:1;visibility:visible;pointer-events:auto;transition:opacity .2s ease,visibility 0s linear 0s}
+        #__titan_dm_modal_mask,#__titan_dm_bl_mask{position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2147483646;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s ease,visibility 0s linear .2s;backdrop-filter:blur(2px)}
+        #__titan_dm_modal_mask.open,#__titan_dm_bl_mask.open{opacity:1;visibility:visible;pointer-events:auto;transition:opacity .2s ease,visibility 0s linear 0s}
+        /* 黑名单遮罩提至与设置弹窗同级，靠后 DOM 叠在设置弹窗之上（编辑器盖在设置上） */
+        #__titan_dm_bl_mask{z-index:2147483647}
         /* 屏蔽词管理窗口 */
         #__titan_dm_block{position:fixed;top:50%;left:50%;transform:translate(-50%,-48%) scale(0.96);width:min(360px,calc(100vw - 32px));max-height:min(70vh,480px);display:flex;flex-direction:column;background:linear-gradient(180deg,rgba(30,30,36,0.98),rgba(18,18,22,0.98));border:1px solid rgba(255,255,255,0.12);border-radius:12px;color:#eee;font-size:12px;box-shadow:0 20px 60px rgba(0,0,0,0.7);z-index:2147483647;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s ease,transform .2s cubic-bezier(.4,0,.2,1),visibility 0s linear .2s;overflow:hidden}
         #__titan_dm_block.open{opacity:1;visibility:visible;pointer-events:auto;transform:translate(-50%,-50%) scale(1)}
@@ -1065,7 +1212,7 @@
         #__titan_dm_block .block-add-btn{padding:8px 16px;background:linear-gradient(180deg,#00b4e8,#0098d6);color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500}
         #__titan_dm_block .block-add-btn:hover{background:linear-gradient(180deg,#1ac5ff,#00a1d6)}
         #__titan_dm_block .block-tip{padding:0 16px 8px;color:#888;font-size:11px}
-        #__titan_dm_block .block-list{flex:1;overflow-y:auto;padding:4px 12px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.2) transparent}
+        #__titan_dm_block .block-list{flex:1;min-height:0;overflow-y:auto;padding:4px 12px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.2) transparent}
         #__titan_dm_block .block-list::-webkit-scrollbar{width:6px}
         #__titan_dm_block .block-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.2);border-radius:3px}
         #__titan_dm_block .block-item{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:6px;transition:background .12s}
@@ -1077,6 +1224,49 @@
         #__titan_dm_block .block-footer{padding:10px 16px;border-top:1px solid rgba(255,255,255,0.08)}
         #__titan_dm_block .block-clear-btn{width:100%;padding:7px;background:rgba(245,80,80,0.1);color:#f88;border:1px solid rgba(245,80,80,0.25);border-radius:6px;cursor:pointer;font-size:11px;transition:all .12s}
         #__titan_dm_block .block-clear-btn:hover{background:rgba(245,80,80,0.2);color:#faa}
+        /* 新站点询问浮层（右下角，带 6s 进度条，超时向右滑出） */
+        #__titan_dm_newsite{position:fixed;right:24px;bottom:116px;width:320px;max-width:calc(100vw - 48px);background:linear-gradient(180deg,rgba(30,30,36,0.98),rgba(18,18,22,0.98));border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:14px 16px;color:#eee;font-size:12px;box-shadow:0 20px 60px rgba(0,0,0,0.7);z-index:2147483647;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;opacity:0;transform:translateX(120%);transition:opacity .25s ease,transform .3s cubic-bezier(.4,0,.2,1);pointer-events:none}
+        #__titan_dm_newsite.show{opacity:1;transform:translateX(0);pointer-events:auto}
+        #__titan_dm_newsite.hide{opacity:0;transform:translateX(120%);pointer-events:none}
+        #__titan_dm_newsite .ns-msg{color:#ddd;line-height:1.5;margin-bottom:10px}
+        #__titan_dm_newsite .ns-btns{display:flex;gap:6px;margin-bottom:10px}
+        #__titan_dm_newsite .ns-btn{flex:1;min-width:0;padding:8px 4px;background:rgba(255,255,255,0.06);color:#eee;border:1px solid rgba(255,255,255,0.12);border-radius:6px;cursor:pointer;font-size:11px;transition:all .12s;text-align:center;display:flex;flex-direction:column;gap:3px;align-items:center}
+        #__titan_dm_newsite .ns-btn:hover{background:rgba(0,161,214,0.18);border-color:rgba(0,161,214,0.4);color:#fff}
+        #__titan_dm_newsite .ns-btn.ns-no{background:rgba(245,80,80,0.1);color:#f88;border-color:rgba(245,80,80,0.25)}
+        #__titan_dm_newsite .ns-btn.ns-no:hover{background:rgba(245,80,80,0.2);color:#faa}
+        #__titan_dm_newsite .ns-sub{display:block;font-size:9px;color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+        #__titan_dm_newsite .ns-bar{height:3px;background:rgba(255,255,255,0.1);border-radius:2px;overflow:hidden}
+        #__titan_dm_newsite .ns-bar>i{display:block;height:100%;width:100%;background:linear-gradient(90deg,#00b4e8,#0098d6);transform-origin:left center;animation:__nsDeplete 6s linear forwards}
+        @keyframes __nsDeplete{from{transform:scaleX(1)}to{transform:scaleX(0)}}
+        /* 黑名单管理窗口（复用屏蔽词窗口调性） */
+        #__titan_dm_blacklist{position:fixed;top:50%;left:50%;transform:translate(-50%,-48%) scale(0.96);width:min(420px,calc(100vw - 32px));max-height:min(80vh,560px);display:flex;flex-direction:column;background:linear-gradient(180deg,rgba(30,30,36,0.98),rgba(18,18,22,0.98));border:1px solid rgba(255,255,255,0.12);border-radius:12px;color:#eee;font-size:12px;box-shadow:0 20px 60px rgba(0,0,0,0.7);z-index:2147483647;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s ease,transform .2s cubic-bezier(.4,0,.2,1),visibility 0s linear .2s;overflow:hidden}
+        #__titan_dm_blacklist.open{opacity:1;visibility:visible;pointer-events:auto;transform:translate(-50%,-50%) scale(1)}
+        #__titan_dm_blacklist .bl-head{display:flex;align-items:center;padding:14px 16px 10px;border-bottom:1px solid rgba(255,255,255,0.08)}
+        #__titan_dm_blacklist .bl-title{flex:1;font-size:14px;font-weight:600;color:#fff}
+        #__titan_dm_blacklist .bl-close{background:transparent;border:0;color:#888;cursor:pointer;font-size:20px;line-height:1}
+        #__titan_dm_blacklist .bl-close:hover{color:#fff}
+        #__titan_dm_blacklist .bl-body{padding:12px 16px;flex:1;overflow-y:auto;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.2) transparent}
+        #__titan_dm_blacklist .bl-tip{color:#888;font-size:11px;line-height:1.6;margin-bottom:10px}
+        #__titan_dm_blacklist .bl-tip code{background:rgba(255,255,255,0.08);padding:1px 5px;border-radius:3px;font-family:Menlo,monospace;color:#9cf}
+        #__titan_dm_blacklist textarea{width:100%;min-height:240px;resize:vertical;background:#222;color:#eee;border:1px solid #444;border-radius:6px;padding:8px 10px;font-size:12px;font-family:Menlo,monospace;line-height:1.5;box-sizing:border-box}
+        #__titan_dm_blacklist textarea:focus{outline:none;border-color:#00a1d6}
+        #__titan_dm_blacklist .bl-footer{padding:10px 16px;border-top:1px solid rgba(255,255,255,0.08)}
+        #__titan_dm_blacklist .bl-save{width:100%;padding:8px;background:linear-gradient(180deg,#00b4e8,#0098d6);color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500;transition:background .12s}
+        #__titan_dm_blacklist .bl-save:hover{background:linear-gradient(180deg,#1ac5ff,#00a1d6)}
+        html.__titan_dm_light__ #__titan_dm_newsite{background:linear-gradient(180deg,#fff,#f4f6f8);color:#222;border-color:rgba(0,0,0,0.12);box-shadow:0 20px 60px rgba(0,0,0,0.2)}
+        html.__titan_dm_light__ #__titan_dm_newsite .ns-msg{color:#222}
+        html.__titan_dm_light__ #__titan_dm_newsite .ns-btn{background:rgba(0,0,0,0.04);color:#222;border-color:rgba(0,0,0,0.12)}
+        html.__titan_dm_light__ #__titan_dm_newsite .ns-btn:hover{background:rgba(0,161,214,0.1);color:#000}
+        html.__titan_dm_light__ #__titan_dm_newsite .ns-sub{color:#888}
+        html.__titan_dm_light__ #__titan_dm_newsite .ns-bar{background:rgba(0,0,0,0.1)}
+        html.__titan_dm_light__ #__titan_dm_blacklist{background:linear-gradient(180deg,#fff,#f4f6f8);color:#222;border-color:rgba(0,0,0,0.12)}
+        html.__titan_dm_light__ #__titan_dm_blacklist .bl-title{color:#111}
+        html.__titan_dm_light__ #__titan_dm_blacklist .bl-close{color:#999}
+        html.__titan_dm_light__ #__titan_dm_blacklist .bl-close:hover{color:#000}
+        html.__titan_dm_light__ #__titan_dm_blacklist .bl-tip{color:#888}
+        html.__titan_dm_light__ #__titan_dm_blacklist .bl-tip code{background:rgba(0,0,0,0.06);color:#0070a8}
+        html.__titan_dm_light__ #__titan_dm_blacklist textarea{background:#fff;color:#222;border-color:#ccc}
+        html.__titan_dm_light__ #__titan_dm_blacklist .bl-footer{border-color:rgba(0,0,0,0.08)}
         #__titan_dm_settings{position:fixed;top:50%;left:50%;transform:translate(-50%,-48%) scale(0.96);width:min(360px,calc(100vw - 32px));max-height:min(80vh,560px);overflow-y:auto;background:linear-gradient(180deg,rgba(30,30,36,0.98),rgba(18,18,22,0.98));border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px 22px;color:#eee;font-size:12px;box-shadow:0 20px 60px rgba(0,0,0,0.7),inset 0 1px 0 rgba(255,255,255,0.06);z-index:2147483647;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s ease,transform .2s cubic-bezier(.4,0,.2,1),visibility 0s linear .2s;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.2) transparent}
         #__titan_dm_settings.open{opacity:1;visibility:visible;pointer-events:auto;transform:translate(-50%,-50%) scale(1);transition:opacity .2s ease,transform .2s cubic-bezier(.4,0,.2,1),visibility 0s linear 0s}
         #__titan_dm_settings .modal-title{font-size:14px;font-weight:600;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,0.1);color:#fff}
@@ -1116,7 +1306,6 @@
         #__titan_dm_ddp_search .ddp-btn:disabled{opacity:0.5;cursor:default}
         #__titan_dm_ddp_search .ddp-match-btn{display:block;width:100%;margin-top:8px;padding:7px;background:rgba(0,161,214,0.1);color:#9cf;border:1px solid rgba(0,161,214,0.3);border-radius:6px;cursor:pointer;font-size:11px;transition:all .12s}
         #__titan_dm_ddp_search .ddp-match-btn:hover{background:rgba(0,161,214,0.2);color:#fff}
-        #__titan_dm_ddp_search .ddp-list{flex:1;overflow-y:auto;overflow-x:hidden;padding:6px 10px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.2) transparent}
         #__titan_dm_ddp_search .ddp-list::-webkit-scrollbar{width:6px}
         #__titan_dm_ddp_search .ddp-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.2);border-radius:3px}
         #__titan_dm_ddp_search .ddp-anime{display:flex;gap:10px;padding:7px;border-radius:8px;cursor:pointer;transition:background .12s;align-items:center}
@@ -1135,8 +1324,8 @@
         #__titan_dm_ddp_search .ddp-status.loading .ddp-spin{display:block}
         @keyframes ddpSpin{to{transform:rotate(360deg)}}
         /* list 区加载遮罩：请求进行中覆盖，禁止误点 */
-        #__titan_dm_ddp_search .ddp-list-wrap{position:relative;flex:1;min-height:0;overflow:hidden}
-        #__titan_dm_ddp_search .ddp-list{height:100%;overflow-y:auto;overflow-x:hidden;padding:6px 10px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.2) transparent}
+        #__titan_dm_ddp_search .ddp-list-wrap{position:relative;flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column}
+        #__titan_dm_ddp_search .ddp-list{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:6px 10px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.2) transparent}
         #__titan_dm_ddp_search .ddp-list::-webkit-scrollbar{width:6px}
         #__titan_dm_ddp_search .ddp-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.2);border-radius:3px}
         #__titan_dm_ddp_search .ddp-loading{position:absolute;inset:0;display:none;align-items:center;justify-content:center;flex-direction:column;gap:10px;background:rgba(18,18,22,0.55);backdrop-filter:blur(1px);z-index:2}
@@ -1157,6 +1346,9 @@
         html.__titan_dm_light__ #__titan_dm_menu__ .title .dm-close{color:#999}
         html.__titan_dm_light__ #__titan_dm_menu__ .title .dm-close:hover{color:#000}
         html.__titan_dm_light__ #__titan_dm_menu__ .title .hint{color:#888}
+        html.__titan_dm_light__ #__titan_dm_menu__ .dm-info{color:#0070a8}
+        html.__titan_dm_light__ #__titan_dm_menu__ .dm-info .dm-save{color:#999}
+        html.__titan_dm_light__ #__titan_dm_menu__ .dm-info .dm-save:hover{color:#0070a8}
         html.__titan_dm_light__ #__titan_dm_menu__ .title-bar{border-color:rgba(0,0,0,0.08)}
         html.__titan_dm_light__ #__titan_dm_menu__ .title-bar .title-text{color:#111}
         html.__titan_dm_light__ #__titan_dm_menu__ .check-group{color:#444}
@@ -1235,13 +1427,317 @@
         html.__titan_dm_light__ #__titan_dm_menu__ .filter-type:hover span{color:#000}
         html.__titan_dm_light__ #__titan_dm_menu__ .filter-type:has(input:checked) svg,html.__titan_dm_light__ #__titan_dm_menu__ .filter-type:has(input:checked) span{color:#00a1d6;fill:#00a1d6}
       `;
-      document.head.appendChild(css);
+      try { document.head.appendChild(css); } catch (e) { /* CSP 等异常不阻断脚本 */ }
     }
     // 应用主题（首次注入即生效；之后 toggle 切换）
-    applyTheme();
+    try { applyTheme(); } catch (e) {}
+  }
+
+  // ============= 通用设置 UI（引擎无关：可在任意页面经油猴菜单打开）=============
+  const $ = (id) => document.getElementById(id);
+  let settingsModal, settingsMask, blacklistModal, blacklistMask;
+  let __settingsUIReady = false;
+
+  // AI 开关切换：保存 enabled 字段 + 实时刷新两个「智能匹配」按钮的显隐
+  function refreshAiMatchVisibility() {
+    const show = aiMatchVisible();
+    const m1 = $('__dm_ddp_match__'); if (m1) m1.style.display = show ? '' : 'none';
+    const m2 = $('__ddp_match2__'); if (m2) m2.style.display = show ? '' : 'none';
+    // 开关 UI 同步
+    const sw = $('__dm_ai_switch__'); if (sw) sw.classList.toggle('on', aiEnabled());
+    const am = $('__dm_auto_match__'); if (am) am.classList.toggle('on', autoMatchEnabled());
+  }
+  function refreshBlacklistVisibility() {
+    const on = blacklistEnabled();
+    const sw = $('__dm_bl_switch__'); if (sw) sw.classList.toggle('on', on);
+    const row = $('__dm_bl_open_row__'); if (row) row.style.display = on ? '' : 'none';
+    const hint = $('__dm_bl_hint__'); if (hint) hint.style.display = on ? '' : 'none';
+  }
+  function renderBlacklist() {
+    const bl = loadBlacklist();
+    $('__dm_bl_text__').value = (bl.patterns || []).join('\n');
+  }
+  // 编辑器直接盖在通用设置之上（不关设置弹窗，保留用户未保存的 AI 配置输入）
+  function openBlacklistModal() {
+    renderBlacklist();
+    blacklistMask.classList.add('open');
+    blacklistModal.classList.add('open');
+  }
+  function closeBlacklistModal() {
+    if (!__settingsUIReady) return;
+    blacklistModal.classList.remove('open');
+    blacklistMask.classList.remove('open');
+  }
+  // 通用设置弹窗：open / close
+  function openSettingsModal() {
+    ensureSettingsUI();
+    settingsModal.classList.add('open');
+    settingsMask.classList.add('open');
+    // 同步弹弹play 代理配置：显示用户自定义值（留空则回退默认，故输入框留空 + placeholder 提示默认）
+    const cfg = loadDdpConfig();
+    $('__dm_ddp_url__').value = cfg.workerUrl || '';
+    $('__dm_ddp_token__').value = cfg.proxyToken != null ? cfg.proxyToken : '';
+    // 同步简繁转换
+    const ch = loadSettings().ddpChConvert;
+    $('__dm_chconvert__').value = (ch != null && ch >= 0 && ch <= 2) ? String(ch) : '1';
+    // 同步 AI 配置 + 开关
+    const ai = loadAiConfig();
+    $('__dm_ai_url__').value = ai.baseUrl || '';
+    $('__dm_ai_key__').value = ai.apiKey || '';
+    $('__dm_ai_model__').value = ai.model || '';
+    $('__dm_ai_switch__').classList.toggle('on', !!ai.enabled);
+    $('__dm_auto_match__').classList.toggle('on', !!ai.autoMatch);
+    // 同步黑名单开关 + 入口显隐
+    refreshBlacklistVisibility();
+  }
+  function closeSettingsModal() {
+    if (!__settingsUIReady) return;
+    settingsModal.classList.remove('open');
+    settingsMask.classList.remove('open');
+  }
+
+  // 创建设置/黑名单 UI + 绑定事件（幂等；引擎无关，任意页面首次打开通用设置时调用）
+  function ensureSettingsUI() {
+    if (__settingsUIReady) return;
+    injectCSS();
+    // 通用设置弹窗（独立的浮层 + 遮罩），挂到 body
+    settingsModal = document.createElement('div');
+    settingsModal.id = '__titan_dm_settings';
+    settingsModal.innerHTML = `
+      <div class="modal-title">⚙ 通用设置</div>
+      <div class="modal-section">配置管理</div>
+      <div class="row"><label>重置所有</label><button class="btn btn-danger" id="__dm_reset_all__">清空所有存储</button></div>
+      <div class="row"><label>导出</label><button class="btn" id="__dm_export__">下载 settings.json</button></div>
+      <div class="row"><label>导入</label><button class="btn" id="__dm_import__">选择 JSON 文件</button></div>
+      <input type="file" id="__dm_import_file" accept=".json" style="display:none">
+      <div class="row"><label>黑名单</label><div id="__dm_bl_switch__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">部分网页不注入弹幕</span></div>
+      <div class="row" id="__dm_bl_open_row__" style="display:none"><button class="btn" id="__dm_bl_open__">🚫 管理黑名单</button></div>
+      <p class="hint" id="__dm_bl_hint__" style="display:none">开启后：新站点首次全自动载入前会询问是否加入；命中规则的站点不注入弹幕（不显示图标/消息）。</p>
+      <div class="modal-section">弹弹play 代理</div>
+      <div class="row"><label>Worker URL</label><input type="text" id="__dm_ddp_url__" placeholder="留空用默认内置 API" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
+      <div class="row"><label>Token</label><input type="text" id="__dm_ddp_token__" placeholder="留空用默认" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
+      <div class="row"><label>简繁转换</label><select id="__dm_chconvert__" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px;cursor:pointer"><option value="1">转换为简体（默认）</option><option value="0">不转换</option><option value="2">转换为繁体</option></select></div>
+      <div class="row"><button class="btn btn-primary" id="__dm_ddp_save__">保存代理配置</button></div>
+      <div class="row"><label>匹配缓存</label><button class="btn btn-danger" id="__dm_ddp_clear_match__">清空已匹配记录</button></div>
+      <p class="hint">部署自己的 Worker 见 <code style="font-size:10px">userscript/worker/README.md</code>；匹配过的视频会记住，下次「智能匹配」直接命中，免重复请求。</p>
+      <div class="modal-section">AI 配置（智能匹配增强）</div>
+      <div class="row"><label>启用 AI</label><div id="__dm_ai_switch__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">开启后「✨ 智能匹配」用 LLM 提取文件名</span></div>
+      <div class="row"><label>全自动载入</label><div id="__dm_auto_match__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">打开视频自动匹配标题->单结果自动载入弹幕（零操作）</span></div>
+      <div class="row"><label>API 地址</label><input type="text" id="__dm_ai_url__" placeholder="填到 /v1，如 https://ai.retr0.xyz/v1" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
+      <div class="row"><label>Key</label><input type="text" id="__dm_ai_key__" placeholder="sk-...（OpenAI 兼容）" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
+      <div class="row"><label>模型</label><input type="text" id="__dm_ai_model__" placeholder="deepseek-chat / gpt-4o-mini 等" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
+      <div class="row"><button class="btn" id="__dm_ai_test__">测试 AI 可用性</button><button class="btn btn-primary" id="__dm_ai_save__">保存 AI 配置</button></div>
+      <p class="hint">开启后显示「✨ 智能匹配当前视频」，使用AI提取番剧名+集号再搜索；关闭则该按钮隐藏。</p>
+      <div class="modal-section">关于</div>
+      <div class="about">
+        <p><b class="about-brand"> 今天要来点弹幕吗？</b></p>
+        <p>脚本版本：<code id="__dm_ver_script__">1.2.1</code></p>
+        <p>引擎：B 站原版 <code>bili-danmaku-x</code>代号[Titan]</p>
+        <p>Bundle：<a href="https://cdn.jsdelivr.net/gh/makabaka11/DFM-Next@master/titan-bundle.js" target="_blank">jsDelivr</a>（11.4 MB）</p>
+        <p>仓库：<a href="https://github.com/makabaka11/web-danmaku-plugin" target="_blank">github.com/makabaka11/web-danmaku-plugin</a></p>
+        <p>作者：Retr0</p>
+        <p class="hint">本脚本仅供个人研究学习使用</p>
+      </div>
+      <div class="sep" style="height:1px;background:rgba(255,255,255,0.08);margin:16px -22px"></div>
+      <button class="btn btn-primary" id="__dm_close_settings__">关闭</button>
+    `;
+    document.body.appendChild(settingsModal);
+    settingsMask = document.createElement('div');
+    settingsMask.id = '__titan_dm_modal_mask';
+    document.body.appendChild(settingsMask);
+    // ============= 全自动载入黑名单管理窗口 ============
+    blacklistModal = document.createElement('div');
+    blacklistModal.id = '__titan_dm_blacklist';
+    blacklistModal.innerHTML = `
+      <div class="bl-head"><span class="bl-title">🚫 全自动载入黑名单</span><button class="bl-close" id="__dm_bl_close__">×</button></div>
+      <div class="bl-body">
+        <p class="bl-tip">每行一条 URL，可使用 <code>*</code> 作为通配符。命中规则的网页将不注入弹幕（不显示图标/消息）。示例：<code>*://*.bilibili.com/*</code></p>
+        <textarea id="__dm_bl_text__" placeholder="*://*.bilibili.com/*&#10;*://*.youtube.com/*&#10;*://video.example.com/*" spellcheck="false"></textarea>
+      </div>
+      <div class="bl-footer"><button class="bl-save" id="__dm_bl_save__">保存</button></div>
+    `;
+    blacklistMask = document.createElement('div');
+    blacklistMask.id = '__titan_dm_bl_mask';  // 独立遮罩，z-index 与设置弹窗同级、靠后 DOM 叠在上层
+    document.body.appendChild(blacklistMask);
+    document.body.appendChild(blacklistModal);  // modal 在 mask 之后追加 -> 同 z 时盖在 mask 上
+
+    // ============= 事件绑定 ============
+    // 弹弹play 代理配置保存（留空字段会回退到内置默认值 ddplay.retr0.xyz）
+    $('__dm_ddp_save__').addEventListener('click', () => {
+      saveDdpConfig({
+        workerUrl: $('__dm_ddp_url__').value.trim(),
+        proxyToken: $('__dm_ddp_token__').value.trim(),
+      });
+      alert(ddpReady() ? ('弹弹play 代理配置已保存 ✓\n当前生效 Worker：' + ddpWorkerUrl()) : '已保存，但 Worker URL 仍为空，功能不可用。');
+    });
+    // 清空匹配缓存
+    $('__dm_ddp_clear_match__').addEventListener('click', () => {
+      if (confirm('清空所有「智能匹配」的历史记录？下次匹配会重新请求弹弹play。（不影响已加载的弹幕）')) {
+        clearMatchCache();
+        alert('已清空匹配缓存。');
+      }
+    });
+    $('__dm_ai_switch__').addEventListener('click', () => {
+      const cfg = loadAiConfig();
+      cfg.enabled = !cfg.enabled;
+      saveAiConfig(cfg);
+      refreshAiMatchVisibility();
+    });
+    // 全自动载入开关
+    $('__dm_auto_match__').addEventListener('click', () => {
+      const cfg = loadAiConfig();
+      cfg.autoMatch = !cfg.autoMatch;
+      saveAiConfig(cfg);
+      refreshAiMatchVisibility();
+    });
+    // 黑名单开关：开 -> 显示「管理黑名单」入口
+    $('__dm_bl_switch__').addEventListener('click', () => {
+      const cfg = loadBlacklist();
+      cfg.enabled = !cfg.enabled;
+      saveBlacklist(cfg);
+      refreshBlacklistVisibility();
+    });
+    // 黑名单管理入口 -> 打开编辑窗口
+    $('__dm_bl_open__').addEventListener('click', () => { openBlacklistModal(); });
+    // 保存：每行一条 -> 去空去重 -> 持久化 -> 关窗（设置弹窗仍开着，保留未保存输入）
+    $('__dm_bl_save__').addEventListener('click', () => {
+      const lines = $('__dm_bl_text__').value.split('\n').map(s => s.trim()).filter(Boolean);
+      const cfg = loadBlacklist();
+      cfg.patterns = lines;
+      saveBlacklist(cfg);
+      closeBlacklistModal();
+      showStatus('🚫 黑名单已保存（' + lines.length + ' 条）', 4000);
+    });
+    // 关闭 / 点遮罩：仅关黑名单编辑器（设置弹窗在下方保持打开）
+    $('__dm_bl_close__').addEventListener('click', closeBlacklistModal);
+    blacklistMask.addEventListener('click', closeBlacklistModal);
+    // AI 配置保存（保留开关状态）
+    $('__dm_ai_save__').addEventListener('click', () => {
+      const old = loadAiConfig();
+      saveAiConfig({
+        enabled: !!old.enabled,
+        autoMatch: !!old.autoMatch,
+        baseUrl: $('__dm_ai_url__').value.trim(),
+        apiKey: $('__dm_ai_key__').value.trim(),
+        model: $('__dm_ai_model__').value.trim(),
+      });
+      refreshAiMatchVisibility();
+      const cfg = loadAiConfig();
+      if (!cfg.enabled) alert('AI 配置已保存 ✓\n但「启用 AI」开关未开，「智能匹配」按钮不显示。请先打开开关。');
+      else if (aiReady()) alert('AI 配置已保存 ✓ 且可用 ✓\n模型：' + cfg.model + '\n现在「✨ 智能匹配」按钮会显示。');
+      else alert('已保存，但 API 地址/模型为空，AI 不可用。请补全后重试。');
+    });
+    // 测试 AI 可用性：用当前输入框值（不必先保存）临时写入并跑一次提取
+    $('__dm_ai_test__').addEventListener('click', async () => {
+      const baseUrl = $('__dm_ai_url__').value.trim();
+      const apiKey = $('__dm_ai_key__').value.trim();
+      const model = $('__dm_ai_model__').value.trim();
+      if (!baseUrl || !model) { alert('请先填写 API 地址和模型'); return; }
+      // 临时写入（不持久化开关，仅让 llmExtractFileName 用到本次配置）
+      const old = loadAiConfig();
+      saveAiConfig({ enabled: true, autoMatch: !!old.autoMatch, baseUrl, apiKey, model });
+      const testBtn = $('__dm_ai_test__');
+      const origTxt = testBtn.textContent;
+      testBtn.disabled = true; testBtn.textContent = '测试中…';
+      try {
+        const ext = await llmExtractFileName('[KTXP&VCB-Studio] Plastic Memories [13][Ma10p_1080p][x265_flac].mkv');
+        if (ext && ext.title) {
+          alert('✅ AI 可用！\n 测试用例：[KTXP&VCB-Studio] Plastic Memories [13][Ma10p_1080p][x265_flac].mkv \n模型：' + model + '\n测试提取结果：\n  番剧名：' + ext.title + (ext.episode ? '\n  集号：' + ext.episode : ''));
+        } else {
+          alert('⚠️ AI 已响应但未提取到有效结果，请检查模型是否支持');
+        }
+      } catch (e) {
+        alert('❌ AI 测试失败：' + e.message);
+      } finally {
+        // 还原开关持久化状态（测试时临时开了 enabled，恢复回 old）
+        saveAiConfig({ enabled: !!old.enabled, autoMatch: !!old.autoMatch, baseUrl, apiKey, model });
+        testBtn.disabled = false; testBtn.textContent = origTxt;
+        refreshAiMatchVisibility();
+      }
+    });
+    // 简繁转换：下拉改即存（弹弹play comment 接口的 chConvert 参数）
+    $('__dm_chconvert__').addEventListener('change', () => {
+      const v = parseInt($('__dm_chconvert__').value, 10);
+      const s = loadSettings();
+      s.ddpChConvert = (v >= 0 && v <= 2) ? v : 1;
+      saveSettings(s);
+    });
+    $('__dm_close_settings__').addEventListener('click', closeSettingsModal);
+    settingsMask.addEventListener('click', closeSettingsModal);
+    // 弹窗内按钮
+    $('__dm_reset_all__').addEventListener('click', () => {
+      if (confirm('确定要清空所有设置？此操作不可撤销。（含弹幕样式设置、弹弹play 代理配置、匹配缓存、AI 配置、黑名单）')) {
+        [STORAGE_KEY, DDP_KEY, MATCH_CACHE_KEY, AI_KEY, RESUME_KEY, BLACKLIST_KEY, SEEN_SITES_KEY].forEach(k => { try { GM_deleteValue(k); } catch (e) {} });
+        alert('已清空。刷新页面后生效。');
+      }
+    });
+    $('__dm_export__').addEventListener('click', () => {
+      const data = {
+        settings: loadSettings(),
+        ddp: loadDdpConfig(),
+        ai: loadAiConfig(),
+        matchCache: loadMatchCache(),
+        blacklist: loadBlacklist(),
+        seenSites: loadSeenSites(),
+      };
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'web-danmaku-plugin-backup.json';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+    $('__dm_import__').addEventListener('click', () => $('__dm_import_file').click());
+    $('__dm_import_file').addEventListener('change', (e) => {
+      const f = e.target.files[0]; if (!f) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const obj = JSON.parse(reader.result);
+          if (obj.settings) saveSettings(obj.settings);
+          if (obj.ddp) saveDdpConfig(obj.ddp);
+          if (obj.ai) saveAiConfig(obj.ai);
+          if (obj.matchCache) saveMatchCache(obj.matchCache);
+          if (obj.blacklist) saveBlacklist(obj.blacklist);
+          if (obj.seenSites) saveSeenSites(obj.seenSites);
+          // 兼容旧格式（导出的是裸 settings 对象而不是包装的）
+          if (!obj.settings && !obj.ddp && !obj.ai && !obj.matchCache && !obj.blacklist) saveSettings(obj);
+          alert('导入成功！' + (obj.settings ? '弹幕设置 + 代理 + AI + 匹配缓存已恢复' : '弹幕设置已恢复'));
+        } catch (err) { alert('导入失败：' + err.message); }
+        e.target.value = '';
+      };
+      reader.readAsText(f);
+    });
+    // Esc 关闭设置/黑名单弹窗（覆盖无引擎页面：此时 injectDanmakuControls 的 onKey 未注册；
+    //   有引擎页面 onKey 也会处理，classList 操作幂等，不冲突）
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      if (blacklistModal && blacklistModal.classList.contains('open')) closeBlacklistModal();
+      else if (settingsModal && settingsModal.classList.contains('open')) closeSettingsModal();
+    });
+    __settingsUIReady = true;
+  }
+
+
+  function injectDanmakuControls(engine, video, adapter) {
+    // 拦截 setSetting：每次调用后自动持久化到 GM 跨站存储
+    const _origSetSetting = engine.setSetting.bind(engine);
+    engine.setSetting = function (k, v) {
+      _origSetSetting(k, v);
+      saveSettings(engine.config.setting);
+    };
+
+    // 控件栏由 adapter 决定（ArtPlayer: .art-controls-right 回退链；通用: null → 浮层按钮兜底）
+    const insertTo = adapter.getControlsBar();
+    if (insertTo) console.log('[web-danmaku-plugin] 控件注入到: ' + insertTo.className);
+    else console.log('[web-danmaku-plugin] 无控件栏，使用浮层按钮');
+
+    // 注入 CSS（一次性）。按钮样式完全复用 ArtPlayer 自带 .art-control（位置/悬浮/高亮都一致），
+    // 这里只写菜单和 .off 状态。
+    injectCSS();
+    ensureSettingsUI();  // 通用设置 UI（引擎无关，任意页面可用）
 
     if (document.getElementById('__titan_dm_btn__')) return;
-    const $ = (id) => document.getElementById(id);
 
     // 按钮：类名/插入位置由 adapter 给（ArtPlayer 复用 .art-control 插到最前；DPlayer 走原生 .dplayer-icon 进右图标组；
     // 通用控件栏走中性样式追加末尾；无控件栏时退回右下浮层按钮）。菜单定位统一复用 #__titan_dm_btn__ rect。
@@ -1267,7 +1763,8 @@
       <div class="dm-panel-move">
         <!-- 常用设置 -->
         <div class="dm-panel">
-          <div class="title"><span class="ttl">弹幕设置 <span class="hint dm-status"></span></span><span class="dm-close" id="__dm_menu_close__" title="关闭">×</span></div>
+          <div class="title"><span class="ttl">弹幕设置</span><span class="dm-close" id="__dm_menu_close__" title="关闭">×</span></div>
+          <div class="dm-info"><span class="dm-status"></span><a class="dm-save" hidden title="保存当前弹幕为 XML 文件">保存弹幕</a></div>
           <div class="row"><label>显示</label><div id="__dm_switch__" class="switch on"></div></div>
           <div class="sep"></div>
           <div class="row"><label>字号</label><input type=range id=__dm_font__ min=50 max=200 value=100 step=5><span class=val id=__dm_fontv__>1.0×</span></div>
@@ -1289,8 +1786,8 @@
           <div class="title-bar">
             <button class="btn-back" data-go-page="1">← 返回</button>
             <span class="title-text">高级设置</span>
-            <span class="hint dm-status"></span>
           </div>
+          <div class="dm-info"><span class="dm-status"></span><a class="dm-save" hidden title="保存当前弹幕为 XML 文件">保存弹幕</a></div>
           <div class="row"><label>全屏同步</label><input type=checkbox class=check id=__dm_fssync__></div>
           <div class="row"><label>顶部偏移</label><input type=number id=__dm_offtop__ value=0 step=1 style="width:60px"></div>
           <div class="row"><label>底部偏移</label><input type=number id=__dm_offbot__ value=0 step=1 style="width:60px"></div>
@@ -1343,48 +1840,6 @@
     // 菜单挂到 body（脱开 art-video-player 的 overflow: hidden 裁切），用 position: fixed 手动定位到 btn 旁边
     document.body.appendChild(menu);
 
-    // 通用设置弹窗（独立的浮层 + 遮罩），也挂到 body
-    const settingsModal = document.createElement('div');
-    settingsModal.id = '__titan_dm_settings';
-    settingsModal.innerHTML = `
-      <div class="modal-title">⚙ 通用设置</div>
-      <div class="modal-section">配置管理</div>
-      <div class="row"><label>重置所有</label><button class="btn btn-danger" id="__dm_reset_all__">清空所有存储</button></div>
-      <div class="row"><label>导出</label><button class="btn" id="__dm_export__">下载 settings.json</button></div>
-      <div class="row"><label>导入</label><button class="btn" id="__dm_import__">选择 JSON 文件</button></div>
-      <input type="file" id="__dm_import_file" accept=".json" style="display:none">
-      <div class="modal-section">弹弹play 代理</div>
-      <div class="row"><label>Worker URL</label><input type="text" id="__dm_ddp_url__" placeholder="留空用默认内置 API" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
-      <div class="row"><label>Token</label><input type="text" id="__dm_ddp_token__" placeholder="留空用默认" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
-      <div class="row"><label>简繁转换</label><select id="__dm_chconvert__" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px;cursor:pointer"><option value="1">转换为简体（默认）</option><option value="0">不转换</option><option value="2">转换为繁体</option></select></div>
-      <div class="row"><button class="btn btn-primary" id="__dm_ddp_save__">保存代理配置</button></div>
-      <div class="row"><label>匹配缓存</label><button class="btn btn-danger" id="__dm_ddp_clear_match__">清空已匹配记录</button></div>
-      <p class="hint">部署自己的 Worker 见 <code style="font-size:10px">userscript/worker/README.md</code>；匹配过的视频会记住，下次「智能匹配」直接命中，免重复请求。</p>
-      <div class="modal-section">AI 配置（智能匹配增强）</div>
-      <div class="row"><label>启用 AI</label><div id="__dm_ai_switch__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">开启后「✨ 智能匹配」用 LLM 提取文件名</span></div>
-      <div class="row"><label>全自动载入</label><div id="__dm_auto_match__" class="switch"></div><span class="hint" style="margin:0 0 0 8px">打开视频自动匹配标题→单结果自动载入弹幕（零操作）</span></div>
-      <div class="row"><label>API 地址</label><input type="text" id="__dm_ai_url__" placeholder="填到 /v1，如 https://ai.retr0.xyz/v1" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
-      <div class="row"><label>Key</label><input type="text" id="__dm_ai_key__" placeholder="sk-...（OpenAI 兼容）" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
-      <div class="row"><label>模型</label><input type="text" id="__dm_ai_model__" placeholder="deepseek-chat / gpt-4o-mini 等" style="flex:1;min-width:0;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:7px 10px;font-size:12px"></div>
-      <div class="row"><button class="btn" id="__dm_ai_test__">测试 AI 可用性</button><button class="btn btn-primary" id="__dm_ai_save__">保存 AI 配置</button></div>
-      <p class="hint">开启后显示「✨ 智能匹配当前视频」，使用AI提取番剧名+集号再搜索；关闭则该按钮隐藏。</p>
-      <div class="modal-section">关于</div>
-      <div class="about">
-        <p><b class="about-brand"> 今天要来点弹幕吗？</b></p>
-        <p>脚本版本：<code id="__dm_ver_script__">1.2.0</code></p>
-        <p>引擎：B 站原版 <code>bili-danmaku-x</code>代号[Titan]</p>
-        <p>Bundle：<a href="https://cdn.jsdelivr.net/gh/makabaka11/DFM-Next@master/titan-bundle.js" target="_blank">jsDelivr</a>（11.4 MB）</p>
-        <p>仓库：<a href="https://github.com/makabaka11/web-danmaku-plugin" target="_blank">github.com/makabaka11/web-danmaku-plugin</a></p>
-        <p>作者：Retr0</p>
-        <p class="hint">本脚本仅供个人研究学习使用</p>
-      </div>
-      <div class="sep" style="height:1px;background:rgba(255,255,255,0.08);margin:16px -22px"></div>
-      <button class="btn btn-primary" id="__dm_close_settings__">关闭</button>
-    `;
-    document.body.appendChild(settingsModal);
-    const settingsMask = document.createElement('div');
-    settingsMask.id = '__titan_dm_modal_mask';
-    document.body.appendChild(settingsMask);
 
     // ============= 屏蔽词管理独立窗口 ============
     const blockModal = document.createElement('div');
@@ -1403,6 +1858,9 @@
     const blockMask = document.createElement('div');
     blockMask.id = '__titan_dm_block_mask';
     document.body.appendChild(blockMask);
+
+
+    // 编辑器直接盖在通用设置之上（不关设置弹窗，保留用户未保存的 AI 配置输入）
 
     function renderBlockList() {
       const s = loadSettings();
@@ -1514,6 +1972,7 @@
             <div class="sub">${animeTypeLabel(a.type)} · ${((a.episodes || []).length)} 集${a.startDate ? ' · ' + String(a.startDate).slice(0, 10) : ''}</div>
           </div>
         </div>`).join('');
+      list.scrollTop = 0;  // 切换到作品视图回到顶部
       list.querySelectorAll('.ddp-anime').forEach(el => {
         el.addEventListener('click', () => renderDdpEpisodes(animes[+el.dataset.i]));
       });
@@ -1532,6 +1991,7 @@
           <span class="ttl">${escapeHtml(e.episodeTitle || '')}</span>
           <span class="load">载入 →</span>
         </div>`).join('') : '<div class="ddp-empty">该剧无剧集数据</div>';
+      list.scrollTop = 0;  // 切换到剧集视图回到顶部
       list.querySelectorAll('.ddp-ep').forEach(el => {
         el.addEventListener('click', () => {
           const idx = +el.dataset.i;
@@ -1620,15 +2080,28 @@
           ddpSetStatus('🤖 AI 提取中… ' + matchText.slice(0, 50), false, { loading: true });
           const ext = await llmExtractFileName(matchText);
           if (ext && ext.title) {
-            ddpSetStatus('🤖 AI 提取: ' + ext.title + (ext.episode ? ' 第' + ext.episode + '集' : '（剧场版）') + '，搜索中…', false, { loading: true });
-            const res = await ddpSearchEpisodes(ext.title, ext.episode);
+            const want = parseWantEpisode(ext.episode);
+            const isSpecial = want.kind === 'special';
+            const epLabel = ext.episode === 'movie' ? '（剧场版）' : (ext.episode ? ' ' + ext.episode : '');
+            ddpSetStatus('🤖 AI 提取: ' + ext.title + epLabel + '，搜索中…', false, { loading: true });
+            // 特殊篇：不用 API 集数过滤（会把 SP1 当正片第1集），拿全部剧集供用户在列表里选
+            const res = await ddpSearchEpisodes(ext.title, isSpecial ? '' : ext.episode);
             const animes = (res && res.animes) || [];
             if (animes.length) {
               ddpLastResults = res;
               ddpCurrentAnime = null;
               $('__ddp_back__').style.display = 'none';
               renderDdpAnimes(res);
-              ddpSetStatus('🤖 AI 命中 ' + animes.length + ' 部作品' + (ext.episode ? '（已定位第' + ext.episode + '集）' : '') + '，点击载入');
+              // 特殊篇尝试客户端定位，提示是否找到
+              let locateMsg = '';
+              if (isSpecial) {
+                let found = false;
+                for (const a of animes) { if (pickSpecialEpisode(a.episodes, want)) { found = true; break; } }
+                locateMsg = found ? '（已定位 ' + ext.episode + '，请在作品内点选）' : '（' + ext.episode + ' 请手动选择）';
+              } else if (ext.episode) {
+                locateMsg = '（已定位 ' + ext.episode + '）';
+              }
+              ddpSetStatus('🤖 AI 命中 ' + animes.length + ' 部作品' + locateMsg + '，点击载入');
               return;
             }
             ddpSetStatus('🤖 AI 提取到「' + ext.title + '」但未搜到作品，请调整关键词', true);
@@ -1703,40 +2176,61 @@
     // 全自动载入：页面加载时自动取标题→AI提取→搜索→单结果自动载入，全程零操作
     async function tryAutoMatch() {
       if (!autoMatchEnabled()) return;
+      // 黑名单兜底：命中规则 -> 跳过（watchVideo 已对黑名单站点整体不注入，这里防御性兜底）
+      if (isUrlBlacklisted()) return;
+      // 新站点首次全自动载入：右下角弹窗询问是否加入黑名单（加入逻辑在弹窗内同步完成；6s 超时默认「否」）
+      if (blacklistEnabled() && isNewSite()) {
+        const choice = await promptNewSiteBlacklist();  // 'root' | 'host' | 'no'
+        if (choice === 'root' || choice === 'host') return;  // 已加入黑名单 -> 本次也跳过
+        // 'no'（含超时）-> 继续全自动载入
+      }
       const title = getPageTitle();
       if (!title || title.length < 2) { showStatus('⚠️ 自动匹配：未获取到可用标题', 6000); return; }
       showStatus('⏳ 自动匹配中…', 0);  // 持续显示，直到结果出来
       try {
         const ext = await llmExtractFileName(title);
         if (!ext || !ext.title) { showStatus('⚠️ 自动匹配：AI 未能从标题提取番剧信息（' + title.slice(0,30) + '…）', 6000); return; }
-        const res = await ddpSearchEpisodes(ext.title, ext.episode);
+        const want = parseWantEpisode(ext.episode);
+        const isSpecial = want.kind === 'special';
+        // 特殊篇（SP/OVA/OAD…）：API 集数过滤会把 SP1 当成正片第1集，故拿全部剧集后客户端定位
+        const res = await ddpSearchEpisodes(ext.title, isSpecial ? '' : ext.episode);
         const animes = (res && res.animes) || [];
-        const single = animes.length === 1 && animes[0].episodes && animes[0].episodes.length === 1;
-        if (!single) {
-          if (animes.length === 0) {
-            showStatus('⚠️ 自动匹配：未搜到「' + ext.title + (ext.episode ? ' 第' + ext.episode + '集' : '') + '」，请手动搜索', 8000);
-            return;
+        // 特殊篇：在每部作品的剧集列表里定位
+        let picked = null, pickedAnime = null, pickedScore = 0;
+        if (isSpecial && animes.length) {
+          for (const a of animes) {
+            const r = pickSpecialEpisode(a.episodes, want);
+            if (r) { picked = r.ep; pickedAnime = a; pickedScore = r.score; break; }
           }
-          // 多结果（多部作品，或单作品多集）：自动打开搜索弹窗，列出候选让用户手动选
-          ddpLastResults = res;       // 缓存搜索结果供弹窗复显
-          $('__ddp_kw__').value = ext.title;  // 预填 AI 提取的标题
-          renderDdpAnimes(res);       // 渲染作品列表（用户点作品 → 列剧集 → 点剧集载入）
-          openDdpModal();             // 打开弹窗（会 closeMenu + 聚焦搜索框）
-          // 覆盖 openDdpModal 的默认渲染：上面 renderDdpAnimes 已渲染，openDdpModal 会再渲染一次 ddpLastResults，结果一致无害
-          ddpSetStatus('🤖 AI 命中 ' + animes.length + ' 部作品，请选择');
-          showStatus('🤖 自动匹配到多部作品，已弹出列表请选择', 6000);
+        }
+        // 唯一定位到一集：正片单结果 / 特殊篇定位成功且唯一作品且匹配可信
+        const singleMain = !isSpecial && animes.length === 1 && animes[0].episodes && animes[0].episodes.length === 1;
+        const confidentSpecial = isSpecial && animes.length === 1 && picked && (want.num == null ? pickedScore >= 50 : pickedScore >= 100);
+        if (singleMain || confidentSpecial) {
+          const a = isSpecial ? pickedAnime : animes[0];
+          const e = isSpecial ? picked : animes[0].episodes[0];
+          const label = (a.animeTitle || '') + ' ' + (e.episodeTitle || ext.episode || ('第' + (e.episodeNumber || 1) + '集'));
+          let comments;
+          try { comments = (await ddpGetComment(e.episodeId)).comments || []; }
+          catch (err) { showStatus('⚠️ 自动匹配：拉取弹幕失败（' + err.message + '）', 8000); return; }
+          const rawList = ddpCommentsToList(comments);
+          if (!rawList.length) { showStatus('⚠️ 自动匹配：' + label + ' 该集暂无弹幕', 6000); return; }
+          applyDanmakuList(rawList, label, { seekTo: video.currentTime || 0 });
+          putMatchCache(video, { episodeId: e.episodeId, animeTitle: a.animeTitle, episodeTitle: e.episodeTitle });
+          showStatus('🎬 自动载入: ' + label + ' · ' + rawList.length + ' 条');
           return;
         }
-        const a = animes[0]; const e = a.episodes[0];
-        const label = (a.animeTitle || '') + ' ' + (e.episodeTitle || ('第' + (e.episodeNumber || 1) + '集'));
-        let comments;
-        try { comments = (await ddpGetComment(e.episodeId)).comments || []; }
-        catch (err) { showStatus('⚠️ 自动匹配：拉取弹幕失败（' + err.message + '）', 8000); return; }
-        const rawList = ddpCommentsToList(comments);
-        if (!rawList.length) { showStatus('⚠️ 自动匹配：' + label + ' 该集暂无弹幕', 6000); return; }
-        applyDanmakuList(rawList, label, { seekTo: video.currentTime || 0 });
-        putMatchCache(video, { episodeId: e.episodeId, animeTitle: a.animeTitle, episodeTitle: e.episodeTitle });
-        showStatus('🎬 自动载入: ' + label + ' · ' + rawList.length + ' 条');
+        // 未定位 / 多结果 -> 打开搜索弹窗让用户手动选
+        if (animes.length === 0) {
+          showStatus('⚠️ 自动匹配：未搜到「' + ext.title + (ext.episode ? ' ' + ext.episode : '') + '」，请手动搜索', 8000);
+          return;
+        }
+        ddpLastResults = res;       // 缓存搜索结果供弹窗复显
+        $('__ddp_kw__').value = ext.title;  // 预填 AI 提取的标题
+        renderDdpAnimes(res);       // 渲染作品列表（用户点作品 -> 列剧集 -> 点剧集载入）
+        openDdpModal();             // 打开弹窗（会 closeMenu + 聚焦搜索框）
+        ddpSetStatus('🤖 AI 命中 ' + animes.length + ' 部作品' + (isSpecial ? '（' + ext.episode + ' 未自动定位，请手动选择）' : '，请选择'));
+        showStatus('🤖 自动匹配到多部作品，已弹出列表请选择', 6000);
       } catch (e) { showStatus('⚠️ 自动匹配失败: ' + (e && e.message ? e.message : e), 8000); }
     }
     // 注册到 engine 上，供 tryInit 在 autoLoad 后调用
@@ -1774,7 +2268,8 @@
       if (opts.seekTo != null) { try { engine.seek(opts.seekTo); } catch (e) {} }  // 5) 恢复内部时间
       if (opts.startPlayback) startPlayback(engine, video); else alignPlayback(engine, video);  // 6) 播放态
       window.__titanLastDmList = rawList;  // 7) 缓存**原始**list（过滤立即生效时重新过滤）
-      setStatus('✓ ' + label + ' · ' + filtered.length + ' / ' + rawList.length + ' 条');
+      __lastLabel = label;
+      setStatus('✓ ' + label + ' · ' + filtered.length + ' / ' + rawList.length + ' 条', true);  // 持久显示载入信息
       return filtered.length;
     }
 
@@ -1874,13 +2369,38 @@
       $('__dm_shrink__').checked = !!s.forbidShrinkState;
     }
 
-    function setStatus(txt) {
+    // 持久状态（载入信息）+ 瞬时状态（错误/刷新等）：瞬时消息 4s 后恢复持久信息
+    let __lastPersistentStatus = '';
+    let __lastLabel = '';
+    function setStatus(txt, persistent) {
+      const showSave = !!(window.__titanLastDmList && window.__titanLastDmList.length);
       menu.querySelectorAll('.dm-status').forEach(el => {
-        el.textContent = txt;
+        el.textContent = txt || '';
         clearTimeout(el.__t);
-        el.__t = setTimeout(() => { el.textContent = ''; }, 4000);
+        if (persistent) {
+          __lastPersistentStatus = txt || '';
+        } else if (txt) {
+          el.__t = setTimeout(() => { el.textContent = __lastPersistentStatus; }, 4000);
+        }
       });
+      menu.querySelectorAll('.dm-save').forEach(el => { if (showSave) el.removeAttribute('hidden'); else el.setAttribute('hidden', ''); });
     }
+    // 保存当前弹幕为 B 站 XML 文件（可被本脚本「载入本地弹幕」再次载入）
+    function saveDanmakuFile() {
+      const rawList = window.__titanLastDmList;
+      if (!rawList || !rawList.length) { setStatus('尚无弹幕可保存'); return; }
+      const esc = s => String(s == null ? '' : s).replace(/[<>&'"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[c]));
+      const body = rawList.map((d, i) => '<d p="' + (d.stime || 0) + ',' + (d.mode || 1) + ',' + (d.size || 25) + ',' + (d.color || 16777215) + ',0,0,' + esc(d.dmid != null && d.dmid !== '' ? d.dmid : ('xml-' + i)) + '">' + esc(d.text) + '</d>').join('\n');
+      const xml = '<?xml version="1.0" encoding="UTF-8"?>\n<i>\n' + body + '\n</i>';
+      const blob = new Blob([xml], { type: 'application/xml' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = ((__lastLabel || 'danmaku').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'danmaku') + '.xml';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+    menu.querySelectorAll('.dm-save').forEach(el => el.addEventListener('click', (e) => { e.stopPropagation(); saveDanmakuFile(); }));
 
     // UI → engine 绑定
     $('__dm_switch__').addEventListener('click', () => {
@@ -1973,160 +2493,6 @@
       openDdpModal();
       doDdpMatch();
     });
-    // 弹弹play 代理配置保存（留空字段会回退到内置默认值 ddplay.retr0.xyz）
-    $('__dm_ddp_save__').addEventListener('click', () => {
-      saveDdpConfig({
-        workerUrl: $('__dm_ddp_url__').value.trim(),
-        proxyToken: $('__dm_ddp_token__').value.trim(),
-      });
-      alert(ddpReady() ? ('弹弹play 代理配置已保存 ✓\n当前生效 Worker：' + ddpWorkerUrl()) : '已保存，但 Worker URL 仍为空，功能不可用。');
-    });
-    // 清空匹配缓存
-    $('__dm_ddp_clear_match__').addEventListener('click', () => {
-      if (confirm('清空所有「智能匹配」的历史记录？下次匹配会重新请求弹弹play。（不影响已加载的弹幕）')) {
-        clearMatchCache();
-        alert('已清空匹配缓存。');
-      }
-    });
-    // AI 开关切换：保存 enabled 字段 + 实时刷新两个「智能匹配」按钮的显隐
-    function refreshAiMatchVisibility() {
-      const show = aiMatchVisible();
-      const m1 = $('__dm_ddp_match__'); if (m1) m1.style.display = show ? '' : 'none';
-      const m2 = $('__ddp_match2__'); if (m2) m2.style.display = show ? '' : 'none';
-      // 开关 UI 同步
-      const sw = $('__dm_ai_switch__'); if (sw) sw.classList.toggle('on', aiEnabled());
-      const am = $('__dm_auto_match__'); if (am) am.classList.toggle('on', autoMatchEnabled());
-    }
-    $('__dm_ai_switch__').addEventListener('click', () => {
-      const cfg = loadAiConfig();
-      cfg.enabled = !cfg.enabled;
-      saveAiConfig(cfg);
-      refreshAiMatchVisibility();
-    });
-    // 全自动载入开关
-    $('__dm_auto_match__').addEventListener('click', () => {
-      const cfg = loadAiConfig();
-      cfg.autoMatch = !cfg.autoMatch;
-      saveAiConfig(cfg);
-      refreshAiMatchVisibility();
-    });
-    // AI 配置保存（保留开关状态）
-    $('__dm_ai_save__').addEventListener('click', () => {
-      const old = loadAiConfig();
-      saveAiConfig({
-        enabled: !!old.enabled,
-        autoMatch: !!old.autoMatch,
-        baseUrl: $('__dm_ai_url__').value.trim(),
-        apiKey: $('__dm_ai_key__').value.trim(),
-        model: $('__dm_ai_model__').value.trim(),
-      });
-      refreshAiMatchVisibility();
-      const cfg = loadAiConfig();
-      if (!cfg.enabled) alert('AI 配置已保存 ✓\n但「启用 AI」开关未开，「智能匹配」按钮不显示。请先打开开关。');
-      else if (aiReady()) alert('AI 配置已保存 ✓ 且可用 ✓\n模型：' + cfg.model + '\n现在「✨ 智能匹配」按钮会显示。');
-      else alert('已保存，但 API 地址/模型为空，AI 不可用。请补全后重试。');
-    });
-    // 测试 AI 可用性：用当前输入框值（不必先保存）临时写入并跑一次提取
-    $('__dm_ai_test__').addEventListener('click', async () => {
-      const baseUrl = $('__dm_ai_url__').value.trim();
-      const apiKey = $('__dm_ai_key__').value.trim();
-      const model = $('__dm_ai_model__').value.trim();
-      if (!baseUrl || !model) { alert('请先填写 API 地址和模型'); return; }
-      // 临时写入（不持久化开关，仅让 llmExtractFileName 用到本次配置）
-      const old = loadAiConfig();
-      saveAiConfig({ enabled: true, autoMatch: !!old.autoMatch, baseUrl, apiKey, model });
-      const testBtn = $('__dm_ai_test__');
-      const origTxt = testBtn.textContent;
-      testBtn.disabled = true; testBtn.textContent = '测试中…';
-      try {
-        const ext = await llmExtractFileName('[KTXP&VCB-Studio] Plastic Memories [13][Ma10p_1080p][x265_flac].mkv');
-        if (ext && ext.title) {
-          alert('✅ AI 可用！\n 测试用例：[KTXP&VCB-Studio] Plastic Memories [13][Ma10p_1080p][x265_flac].mkv \n模型：' + model + '\n测试提取结果：\n  番剧名：' + ext.title + (ext.episode ? '\n  集号：' + ext.episode : ''));
-        } else {
-          alert('⚠️ AI 已响应但未提取到有效结果，请检查模型是否支持');
-        }
-      } catch (e) {
-        alert('❌ AI 测试失败：' + e.message);
-      } finally {
-        // 还原开关持久化状态（测试时临时开了 enabled，恢复回 old）
-        saveAiConfig({ enabled: !!old.enabled, autoMatch: !!old.autoMatch, baseUrl, apiKey, model });
-        testBtn.disabled = false; testBtn.textContent = origTxt;
-        refreshAiMatchVisibility();
-      }
-    });
-    // 简繁转换：下拉改即存（弹弹play comment 接口的 chConvert 参数）
-    $('__dm_chconvert__').addEventListener('change', () => {
-      const v = parseInt($('__dm_chconvert__').value, 10);
-      const s = loadSettings();
-      s.ddpChConvert = (v >= 0 && v <= 2) ? v : 1;
-      saveSettings(s);
-    });
-
-    // 通用设置弹窗：open / close
-    function openSettingsModal() {
-      settingsModal.classList.add('open');
-      settingsMask.classList.add('open');
-      // 同步弹弹play 代理配置：显示用户自定义值（留空则回退默认，故输入框留空 + placeholder 提示默认）
-      const cfg = loadDdpConfig();
-      $('__dm_ddp_url__').value = cfg.workerUrl || '';
-      $('__dm_ddp_token__').value = cfg.proxyToken != null ? cfg.proxyToken : '';
-      // 同步简繁转换
-      const ch = loadSettings().ddpChConvert;
-      $('__dm_chconvert__').value = (ch != null && ch >= 0 && ch <= 2) ? String(ch) : '1';
-      // 同步 AI 配置 + 开关
-      const ai = loadAiConfig();
-      $('__dm_ai_url__').value = ai.baseUrl || '';
-      $('__dm_ai_key__').value = ai.apiKey || '';
-      $('__dm_ai_model__').value = ai.model || '';
-      $('__dm_ai_switch__').classList.toggle('on', !!ai.enabled);
-      $('__dm_auto_match__').classList.toggle('on', !!ai.autoMatch);
-    }
-    function closeSettingsModal() {
-      settingsModal.classList.remove('open');
-      settingsMask.classList.remove('open');
-    }
-    $('__dm_close_settings__').addEventListener('click', closeSettingsModal);
-    settingsMask.addEventListener('click', closeSettingsModal);
-    // 弹窗内按钮
-    $('__dm_reset_all__').addEventListener('click', () => {
-      if (confirm('确定要清空所有设置？此操作不可撤销。（含弹幕样式设置、弹弹play 代理配置、匹配缓存、AI 配置）')) {
-        [STORAGE_KEY, DDP_KEY, MATCH_CACHE_KEY, AI_KEY, RESUME_KEY].forEach(k => { try { GM_deleteValue(k); } catch (e) {} });
-        alert('已清空。刷新页面后生效。');
-      }
-    });
-    $('__dm_export__').addEventListener('click', () => {
-      const data = {
-        settings: loadSettings(),
-        ddp: loadDdpConfig(),
-        ai: loadAiConfig(),
-        matchCache: loadMatchCache(),
-      };
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = 'web-danmaku-plugin-backup.json';
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    });
-    $('__dm_import__').addEventListener('click', () => $('__dm_import_file').click());
-    $('__dm_import_file').addEventListener('change', (e) => {
-      const f = e.target.files[0]; if (!f) return;
-      const reader = new FileReader();
-      reader.onload = () => {
-        try {
-          const obj = JSON.parse(reader.result);
-          if (obj.settings) saveSettings(obj.settings);
-          if (obj.ddp) saveDdpConfig(obj.ddp);
-          if (obj.ai) saveAiConfig(obj.ai);
-          if (obj.matchCache) saveMatchCache(obj.matchCache);
-          // 兼容旧格式（导出的是裸 settings 对象而不是包装的）
-          if (!obj.settings && !obj.ddp && !obj.ai && !obj.matchCache) saveSettings(obj);
-          alert('导入成功！' + (obj.settings ? '弹幕设置 + 代理 + AI + 匹配缓存已恢复' : '弹幕设置已恢复'));
-        } catch (err) { alert('导入失败：' + err.message); }
-        e.target.value = '';
-      };
-      reader.readAsText(f);
-    });
 
     // 打开/关闭
     let menuOpen = false;
@@ -2136,7 +2502,8 @@
     // Esc 关弹窗（优先）或菜单（onKey 仅在菜单打开期间注册）
     const onKey = (e) => {
       if (e.key !== 'Escape') return;
-      if (settingsModal.classList.contains('open')) closeSettingsModal();
+      if (blacklistModal.classList.contains('open')) closeBlacklistModal();
+      else if (settingsModal.classList.contains('open')) closeSettingsModal();
       else if (menuOpen) closeMenu();
     };
     const positionMenu = positionMenuGlobal;  // 用全局版本（fullscreenchange 监听需要访问）
@@ -2173,8 +2540,8 @@
     // 初始化按钮可见态
     btn.classList.toggle('off', !engine.config.setting.visible);
 
-    // 暴露 setStatus 给 console 调试
-    if (window.__titan) window.__titan.setStatus = setStatus;
+    // 暴露 setStatus / openSettings 给 console 调试 + 油猴菜单
+    if (window.__titan) { window.__titan.setStatus = setStatus; window.__titan.openSettings = openSettingsModal; }
   }
 
   // 右下角状态提示。durationMs=0 表示不自动消失（持续显示直到下次调用覆盖）。
@@ -2193,6 +2560,62 @@
     if (durationMs > 0) el.__t = setTimeout(() => { el.style.display = 'none'; }, durationMs);
   }
 
+  // 新站点首次全自动载入前的询问浮层（右下角）。返回 Promise<'root'|'host'|'no'>。
+  // 6s 进度条走完自动向右滑出关闭并默认选「否」；点击任一按钮立即执行并滑出。
+  // 用共享 Promise 去重：同一时刻只弹一个，并发调用复用同一个结果。
+  let __newSitePromptPromise = null;
+  function promptNewSiteBlacklist() {
+    if (__newSitePromptPromise) return __newSitePromptPromise;
+    __newSitePromptPromise = new Promise((resolve) => {
+      const host = location.hostname || '';
+      const root = getRootDomain(host);
+      let el = document.getElementById('__titan_dm_newsite');
+      if (el) el.remove();
+      el = document.createElement('div');
+      el.id = '__titan_dm_newsite';
+      el.innerHTML =
+        '<div class="ns-msg">检测到这个新站点中有视频元素，是否要将其加入黑名单？</div>' +
+        '<div class="ns-btns">' +
+          '<button type="button" class="ns-btn" data-act="root">根域名<span class="ns-sub">' + root + '</span></button>' +
+          '<button type="button" class="ns-btn" data-act="host">仅当前域名<span class="ns-sub">' + host + '</span></button>' +
+          '<button type="button" class="ns-btn ns-no" data-act="no">否</button>' +
+        '</div>' +
+        '<div class="ns-bar"><i></i></div>';
+      document.body.appendChild(el);
+      // 入场（下一帧加 show 触发过渡）
+      requestAnimationFrame(() => el.classList.add('show'));
+
+      let done = false;
+      const finish = (act) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        // 加入黑名单的逻辑直接在此同步执行（不依赖调用方 async 续行，避免续行丢失导致未保存）
+        markSiteSeen(root);  // 无论选什么，标记已访问，避免重复打扰
+        let added = false;
+        if (act === 'root') {
+          addBlacklistPatterns(['*://*.' + root + '/*', '*://' + root + '/*']);
+          showStatus('🚫 已将 ' + root + ' 加入黑名单，即将刷新生效…', 6000);
+          added = true;
+        } else if (act === 'host') {
+          addBlacklistPatterns(['*://' + host + '/*']);
+          showStatus('🚫 已将 ' + host + ' 加入黑名单，即将刷新生效…', 6000);
+          added = true;
+        }
+        el.classList.remove('show');
+        el.classList.add('hide');  // 向右滑出
+        setTimeout(() => { if (el.parentNode) el.remove(); }, 320);
+        __newSitePromptPromise = null;
+        resolve(act);
+        // 加入黑名单后刷新页面，让拦截立即生效（刷新后 watchVideo 重跑 -> isUrlBlacklisted 命中 -> 不注入弹幕）
+        if (added) setTimeout(() => { try { location.reload(); } catch (e) {} }, 700);
+      };
+      el.querySelectorAll('.ns-btn').forEach(b => b.addEventListener('click', () => finish(b.getAttribute('data-act'))));
+      const timer = setTimeout(() => finish('no'), 6000);  // 进度条走完 -> 默认「否」
+    });
+    return __newSitePromptPromise;
+  }
+
   // ============= 主流程：MutationObserver 监听 video 出现 =============
   let activeEngine = null;
   let initingVideo = null;  // 初始化锁：标记当前正在 init 的 video，防止并发 tryInit 竞态
@@ -2204,11 +2627,15 @@
       activeEngine = null;
     }
     initingVideo = null;  // 清理时一并释放初始化锁
-    ['__titan_dm_btn__','__titan_dm_menu__','__titan_dm_settings','__titan_dm_modal_mask','__titan_dm_block','__titan_dm_block_mask','__titan_dm_ddp_search','__titan_dm_ddp_mask','__titan_roll_layer__','__titan_cmd_layer__','__titan_rotate_layer__','__titan_status__']
+    // 注：通用设置/黑名单 UI（__titan_dm_settings/__titan_dm_modal_mask/__titan_dm_blacklist/__titan_dm_bl_mask）
+    //   由 ensureSettingsUI 管理（引擎无关、幂等），不随引擎清理，换集/导航后仍可打开。
+    ['__titan_dm_btn__','__titan_dm_menu__','__titan_dm_block','__titan_dm_block_mask','__titan_dm_ddp_search','__titan_dm_ddp_mask','__titan_roll_layer__','__titan_cmd_layer__','__titan_rotate_layer__','__titan_status__']
       .forEach(id => { const e = document.getElementById(id); if (e) e.remove(); });
   }
 
   function watchVideo() {
+    // 黑名单站点：整体不注入（不显示弹幕图标、不显示「正在匹配」等消息）
+    if (isUrlBlacklisted()) return;
     const tryInit = async (video) => {
       if (video.__titanBound) return;
       if (initingVideo) return;  // 已有 init 进行中，跳过（避免并发：await getEngine 期间又触发一次）
@@ -2247,6 +2674,10 @@
             if (video.readyState >= 1) seekVideo();
             else video.addEventListener('loadedmetadata', seekVideo, { once: true });
             showStatus('✓ 已恢复弹幕与播放位置（' + ct.toFixed(0) + 's）');
+            // 同步菜单状态行（持久显示载入信息 + 露出「保存弹幕」）
+            if (window.__titan && typeof window.__titan.setStatus === 'function') {
+              window.__titan.setStatus('✓ ' + (resume.label || '已恢复弹幕') + ' · ' + filtered.length + ' / ' + resume.rawList.length + ' 条', true);
+            }
           } catch (e) { showStatus('⚠️ 恢复失败: ' + e.message); }
           clearResume();
         } else {
@@ -2337,12 +2768,23 @@
     });
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', watchVideo);
-  } else {
-    watchVideo();
+  // 油猴菜单：尽早注册（任意页面可用，方便调试与解封）。放在最前，
+  // 确保后续 injectCSS/watchVideo 即使抛错也不影响菜单可用。
+  if (typeof GM_registerMenuCommand === 'function') {
+    GM_registerMenuCommand('⚙ 通用设置', openSettingsModal);
   }
 
+  injectCSS();  // 尽早注入样式（含黑名单/无视频页面，供油猴菜单打开设置时使用）
+
+  try {
+    const startWatch = () => { try { watchVideo(); } catch (e) { console.error('[web-danmaku-plugin] watchVideo error:', e); } };
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', startWatch);
+    } else {
+      startWatch();
+    }
+  } catch (e) { console.error('[web-danmaku-plugin] init error:', e); }
+
   // 暴露核心函数供 dev/test 端到端验证（生产环境无害，单一命名空间）
-  window.__titan = { injectControls: injectDanmakuControls, getEngine, createAdapter, parseAny, parseDandanplayApi, ddpCommentsToList, filePathFromVideo, getPageTitle, loadDdpConfig, saveDdpConfig, ddpSearchEpisodes, ddpGetComment, ddpMatch, loadMatchCache, saveMatchCache, getMatchCache, putMatchCache, clearMatchCache, matchCacheKeyOf, loadAiConfig, saveAiConfig, aiReady, aiEnabled, autoMatchEnabled, llmExtractFileName, loadResume, saveResume, clearResume, pageTitleSnapshot: _PAGE_TITLE_SNAPSHOT, engine: null, adapter: null, setStatus: null };
+  window.__titan = { injectControls: injectDanmakuControls, getEngine, createAdapter, parseAny, parseDandanplayApi, ddpCommentsToList, filePathFromVideo, getPageTitle, loadDdpConfig, saveDdpConfig, ddpSearchEpisodes, ddpGetComment, ddpMatch, loadMatchCache, saveMatchCache, getMatchCache, putMatchCache, clearMatchCache, matchCacheKeyOf, loadAiConfig, saveAiConfig, aiReady, aiEnabled, autoMatchEnabled, llmExtractFileName, loadResume, saveResume, clearResume, loadBlacklist, saveBlacklist, blacklistEnabled, isUrlBlacklisted, getRootDomain, isNewSite, markSiteSeen, promptNewSiteBlacklist, pageTitleSnapshot: _PAGE_TITLE_SNAPSHOT, engine: null, adapter: null, setStatus: null, openSettings: openSettingsModal };
 })();

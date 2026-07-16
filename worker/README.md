@@ -38,6 +38,32 @@
 
 5. 把 Worker URL（以及 PROXY_TOKEN，若设了）填进用户脚本菜单 →「⚙ 通用设置」→「弹弹play 代理」分区。
 
+## D1 搜索缓存（可选，推荐）
+
+Worker 支持把搜过的「番剧名 -> animeId」存入 D1 数据库，下次同名搜索直接用 animeId 调 `bangumi/{id}` 取最新 episodes 返回，**省掉 search 调用、避开 search 滥用检测**。episodes 不缓存（连载会更新）。未配置 D1 时 Worker 自动回退原行为，不影响功能。
+
+启用步骤：
+
+1. 创建数据库（得到 `database_id`）：
+   ```bash
+   npx wrangler d1 create dandanplay-cache
+   ```
+2. 把输出的 `database_id` 填进 `wrangler.toml` 的 `[[d1_databases]]` 段。
+3. 建表（代码首次请求也会 `CREATE TABLE IF NOT EXISTS` 兜底，但建议显式建一次）：
+   ```bash
+   # 远程（生产）
+   npx wrangler d1 execute dandanplay-cache --remote --command "CREATE TABLE IF NOT EXISTS anime_id_cache (query TEXT PRIMARY KEY, anime_id INTEGER NOT NULL, anime_title TEXT, ts INTEGER DEFAULT (unixepoch()))"
+   # 本地（wrangler dev）
+   npx wrangler d1 execute dandanplay-cache --local --command "CREATE TABLE IF NOT EXISTS anime_id_cache (query TEXT PRIMARY KEY, anime_id INTEGER NOT NULL, anime_title TEXT, ts INTEGER DEFAULT (unixepoch()))"
+   ```
+4. `npx wrangler deploy`。
+
+行为说明：
+
+- **API 有结果即写入**：搜索词 -> `animes[0]`（保下次同搜索词命中）+ 每个返回的 `animeTitle` -> 各自 id（都写入，数据准确）。多结果也写。
+- 命中缓存后走 `bangumi/{id}` 只返回单个（`animes[0]`），手动搜索多候选的第二次会变单结果；自动载入本就取 `animes[0]`，不受影响。Worker 端按 API 语义复现 `episode` 过滤（纯数字 -> 该集；`movie` -> 剧场版；其他 -> `episodeTitle` 包含）。
+- D1 任何异常（未配置 / 读写出错 / bangumi 失败）均静默降级回 search，不阻断请求。
+
 ## 本地调试
 
 ```bash

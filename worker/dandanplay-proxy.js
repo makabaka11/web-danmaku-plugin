@@ -92,6 +92,91 @@ async function buildAuthHeaders(pathname, env) {
   return h;
 }
 
+// ── D1 缓存：番剧名 -> animeId ───────────────────────────────────────────────
+// 目的：命中过的搜索把「番剧名->animeId」存 D1，下次直接用 animeId 调 bangumi/{id} 取最新 episodes，
+//       省掉 search 调用、避开 search 滥用检测。episodes 不缓存（连载会更新）。
+// 写入：API 有结果即把「番剧名->id」全部回填（数据准确）：搜索词->animes[0]（保同搜索词命中）
+//       + 每个返回的 animeTitle->各自 id。多结果也写。命中后走 bangumi 只返回单个（animes[0]），
+//       故手动搜索多候选的第二次会变单结果（自动载入本就取 animes[0]，不受影响）。
+// 降级：env.DB 缺失或任何 D1 异常 -> 回退原 search 流程，不阻断。
+let _schemaReady = false;  // 同一 isolate 只建一次表
+async function ensureSchema(env) {
+  if (_schemaReady || !env.DB) return;
+  try {
+    await env.DB.prepare(
+      'CREATE TABLE IF NOT EXISTS anime_id_cache (' +
+      'query TEXT PRIMARY KEY, anime_id INTEGER NOT NULL, anime_title TEXT, ts INTEGER DEFAULT (unixepoch()))'
+    ).run();
+    _schemaReady = true;
+  } catch (e) { /* 建表失败不阻断，后续读写会自然降级 */ }
+}
+
+function normalizeQuery(s) {
+  return (s || '').trim().toLowerCase();
+}
+
+// 复现弹弹play search/episodes 的 episode 过滤语义（bangumi 返回全集，需在 Worker 端过滤）：
+//   空 -> 全集；纯数字 -> 该集（episodeNumber 匹配）；其他 -> episodeTitle 包含。
+//   "movie" 由调用方在 anime 层判定（剧场版），不进这里。
+function filterEpisodes(episodes, episode) {
+  if (!Array.isArray(episodes)) return [];
+  const ep = (episode || '').trim();
+  if (!ep) return episodes;
+  if (/^\d+$/.test(ep)) {
+    return episodes.filter((e) => {
+      const n = e && e.episodeNumber != null ? String(e.episodeNumber).trim() : '';
+      return n === ep || (n && Number(n) === Number(ep));
+    });
+  }
+  return episodes.filter((e) => ((e && e.episodeTitle) || '').includes(ep));
+}
+
+// 用 animeId 调 bangumi/{id} 取最新 episodes，适配成 search/episodes 的 {animes:[...]} 格式。
+// bangumi 的 BangumiEpisode 字段（episodeId/episodeTitle/episodeNumber）与脚本期望一致，无需重命名。
+// 带 episode 则按 API 语义过滤全集。失败返回 null（调用方降级走 search）。
+async function fetchBangumiAsSearch(env, animeId, episode) {
+  const pathname = '/api/v2/bangumi/' + encodeURIComponent(animeId);
+  const authHeaders = await buildAuthHeaders(pathname, env);
+  let resp;
+  try {
+    resp = await fetch(UPSTREAM + pathname, {
+      method: 'GET',
+      redirect: 'manual',
+      headers: { ...authHeaders, Accept: 'application/json' },
+      cf: { cacheTtl: 60, cacheEverything: true },  // 短缓存：兼顾最新 episodes 与配额
+    });
+  } catch (e) { return null; }
+  if (!resp.ok) return null;  // bangumi 不应 302；非 2xx 视为失败
+  let obj;
+  try { obj = await resp.json(); } catch (e) { return null; }
+  if (!obj || obj.success === false || obj.errorCode) return null;
+  const bg = obj.bangumi;
+  if (!bg || bg.animeId == null) return null;
+  const eps = Array.isArray(bg.episodes) ? bg.episodes.map((e) => ({
+    episodeId: e.episodeId,
+    episodeTitle: e.episodeTitle || null,
+    episodeNumber: e.episodeNumber != null ? String(e.episodeNumber) : null,
+  })) : [];
+  const anime = {
+    animeId: bg.animeId,
+    animeTitle: bg.animeTitle || null,
+    type: bg.type,
+    typeDescription: bg.typeDescription || null,
+    episodes: eps,
+  };
+  const ep = (episode || '').trim();
+  if (ep.toLowerCase() === 'movie') {
+    // 剧场版请求：非剧场版番剧 -> 无结果（贴近 API「仅保留剧场版」语义）
+    const t = String(anime.type || '').toLowerCase();
+    if (!['movie', 'jpmovie', 'tmdbmovie'].includes(t)) {
+      return { success: true, errorCode: 0, hasMore: false, animes: [] };
+    }
+  } else {
+    anime.episodes = filterEpisodes(anime.episodes, ep);
+  }
+  return { success: true, errorCode: 0, hasMore: false, animes: [anime] };
+}
+
 function healthPage(env) {
   const mode = env.DDP_AUTH_MODE || 'both';
   const hasId = !!(env.DDP_APP_ID && env.DDP_APP_SECRET);
@@ -202,6 +287,29 @@ export default {
       }
     }
 
+    // search/episodes：先查 D1 缓存（番剧名->animeId）。命中则用 animeId 调 bangumi/{id}
+    // 取最新 episodes 返回，省掉本次 search 调用。未配置 DB / 未命中 / bangumi 失败 -> 继续走 search。
+    const isSearchEpisodes = url.pathname === '/api/v2/search/episodes' && request.method === 'GET';
+    if (isSearchEpisodes && env.DB) {
+      await ensureSchema(env);
+      const nq = normalizeQuery(url.searchParams.get('anime'));
+      if (nq.length >= 2) {
+        let row = null;
+        try {
+          row = await env.DB.prepare(
+            'SELECT anime_id AS animeId, anime_title AS animeTitle FROM anime_id_cache WHERE query = ?'
+          ).bind(nq).first();
+        } catch (e) { /* D1 读异常：降级走 search */ }
+        if (row && row.animeId != null) {
+          const adapted = await fetchBangumiAsSearch(env, row.animeId, url.searchParams.get('episode') || '');
+          if (adapted) {
+            return jsonResponse(200, adapted, env, { 'Cache-Control': 'public, max-age=60' });
+          }
+          // bangumi 失败 -> 降级走 search（落到下面）
+        }
+      }
+    }
+
     // 鉴权头（签名只用 pathname，不含 query）
     const authHeaders = await buildAuthHeaders(url.pathname, env);
 
@@ -253,6 +361,42 @@ export default {
     const outHeaders = new Headers(resp.headers);
     for (const [k, v] of Object.entries(cors)) outHeaders.set(k, v);
     outHeaders.set('Cache-Control', 'public, max-age=' + maxAge);
+
+    // search/episodes 未命中缓存：走完上游后，把 API 返回的「番剧名->id」全部回填 D1（数据准确）：
+    //   ① 搜索词 -> animes[0]（保证下次同搜索词必命中）
+    //   ② 每个返回的 animeTitle -> 各自 id（满足「都写入」，且用准确番剧名搜索也命中）
+    // 用读出的 body 返回（search 响应是 JSON、非流式，读取无副作用）。
+    if (isSearchEpisodes && env.DB && resp.status >= 200 && resp.status < 300) {
+      try {
+        const text = await resp.text();
+        let obj = null;
+        try { obj = JSON.parse(text); } catch (e) {}
+        if (obj && Array.isArray(obj.animes) && obj.animes.length >= 1) {
+          const nq = normalizeQuery(url.searchParams.get('anime'));
+          const pairs = [];  // [query, animeId, animeTitle]
+          const seen = new Set();
+          const push = (key, a) => {
+            if (!a || a.animeId == null || key.length < 2 || seen.has(key)) return;
+            seen.add(key);
+            pairs.push([key, a.animeId, a.animeTitle || null]);
+          };
+          push(nq, obj.animes[0]);                                            // ① 搜索词 -> animes[0]
+          for (const a of obj.animes) push(normalizeQuery(a.animeTitle), a);  // ② 每个番剧名 -> id
+          if (pairs.length) {
+            try {
+              const stmt = env.DB.prepare('INSERT OR REPLACE INTO anime_id_cache (query, anime_id, anime_title) VALUES (?, ?, ?)');
+              await env.DB.batch(pairs.map((p) => stmt.bind(p[0], p[1], p[2])));
+            } catch (e) { /* 写缓存失败不影响响应 */ }
+          }
+        }
+        const outHeaders2 = new Headers(resp.headers);
+        for (const [k, v] of Object.entries(cors)) outHeaders2.set(k, v);
+        outHeaders2.set('Cache-Control', 'public, max-age=' + maxAge);
+        return new Response(text, { status: resp.status, headers: outHeaders2 });
+      } catch (e) {
+        return jsonResponse(502, { success: false, errorMessage: 'failed to read upstream', detail: String(e) }, env);
+      }
+    }
 
     // 透传响应体 + 状态（非 2xx 也透传，让脚本读到错误 JSON）
     return new Response(resp.body, { status: resp.status, headers: outHeaders });
