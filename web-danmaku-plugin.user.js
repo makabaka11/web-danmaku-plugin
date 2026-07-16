@@ -757,13 +757,20 @@
   // prompt 要求只返回 JSON。失败返回 null（调用方回退到原 fileName 匹配）。
   const LLM_TIMEOUT_MS = 20000;
   const LLM_SYSTEM_PROMPT =
-    '你是一个动漫视频文件名/网页标题解析助手。输入文本可能含字幕组、分辨率、编码、集号等杂质。' +
-    '请提取干净的番剧标题(title)和集号(episode)。\n' +
+    '你是一个动漫视频文件名/网页标题解析助手。输入文本可能含字幕组、分辨率、编码、集号等杂质。请提取干净的番剧标题(title)和集号(episode)。\n' +
+    '重要：区分「季度」与「集号」\n' +
+    '- 季度信息（Season N / 第N季 / Nst Season / S2 / 2nd / II 等）属于 title 的一部分，绝不要当成 episode。例：Yuru Camp Season 3 中的 "Season 3" 是季度，episode 不是 3。\n' +
+    '- episode 只取真正的集号标签，如 [01]、[12]、[OVA01]、[SP1]、[OAD1]。\n' +
     'episode 规则（务必遵守，匹配错误会加载错弹幕）：\n' +
     '- TV 正片：纯数字，去前导0。如 "1"、"12"；"01"->"1"。\n' +
     '- 剧场版/电影：填 "movie"。\n' +
-    '- 特殊篇（SP/OVA/OAD/OP/ED 等）：保留类型前缀+数字，去前导0。如 "SP1"、"SP2"、"OVA1"、"OAD1"；"OVA01"->"OVA1"。无数字时只填前缀，如 "SP"、"OVA"。\n' +
-    '- 关键：SP1/OVA1/OAD1 等是「特殊篇」而不是「第1集」，绝不能去掉前缀变成 "1"。\n' +
+    '- 特殊篇（SP/OVA/OAD/OP/ED 等）：保留类型前缀+数字，去前导0。如 "SP1"、"OVA1"；"OVA01"->"OVA1"。无数字只填前缀。\n' +
+    '- 若没有明确集号标签（仅有季度或片名），episode 填 ""。\n' +
+    '- 关键：SP1/OVA1/OAD1 是特殊篇不是第1集；Season 3 / S2 是季度不是第3/2集。\n' +
+    '示例：\n' +
+    '- "[Airota&VCB-Studio] Yuru Camp Season 3 [OVA01][Ma10p_1080p][x265_flac].mkv" -> {"title":"Yuru Camp Season 3","episode":"OVA1"}\n' +
+    '- "[Sub] Anime S2 [05][1080p].mkv" -> {"title":"Anime S2","episode":"5"}\n' +
+    '- "[Group] 番名 第二季 [SP2].mkv" -> {"title":"番名 第二季","episode":"SP2"}\n' +
     '只输出 JSON，不要解释：{"title":"...","episode":"..."}。title 用原始语言（中文/日文/英文，取主体名）。';
 
   // ============= 集号解析与特殊篇匹配 =============
@@ -891,6 +898,11 @@
     return await ddpFetch('/api/v2/comment/' + encodeURIComponent(episodeId), {
       query: { withRelated: 'true', chConvert: String(chConvert) },
     });
+  }
+  // 拉取某作品的全部剧集（BangumiDetails.episodes，含 episodeNumber）-- 用于「获取全部剧集」
+  async function ddpGetBangumi(animeId) {
+    const obj = await ddpFetch('/api/v2/bangumi/' + encodeURIComponent(animeId));
+    return (obj && obj.bangumi) || null;
   }
 
   // 按文件名智能匹配剧集（POST /match；跳过 fileHash 以免浏览器拉前 16MB）
@@ -1319,6 +1331,9 @@
         #__titan_dm_ddp_search .ddp-ep .no{flex:0 0 34px;color:#9cf;font-family:Menlo,monospace;font-size:11px}
         #__titan_dm_ddp_search .ddp-ep .ttl{flex:1;min-width:0;color:#ddd;font-size:12px;word-break:break-word;line-height:1.4}
         #__titan_dm_ddp_search .ddp-ep .load{font-size:10px;color:#666}
+        /* 剧集列表底部「获取全部剧集」入口（筛选可能漏集时出现） */
+        #__titan_dm_ddp_search .ddp-all-eps{margin:10px 0 2px;padding:8px;text-align:center;font-size:11px;color:#888;cursor:pointer;border:1px dashed rgba(255,255,255,0.15);border-radius:6px;transition:all .12s}
+        #__titan_dm_ddp_search .ddp-all-eps:hover{color:#9cf;border-color:rgba(0,161,214,0.4);background:rgba(0,161,214,0.06)}
         #__titan_dm_ddp_search .ddp-status{padding:8px 16px 12px;color:#9cf;font-size:11px;min-height:18px;border-top:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;gap:8px}
         #__titan_dm_ddp_search .ddp-status .ddp-spin{flex:0 0 auto;width:13px;height:13px;border:2px solid rgba(0,161,214,0.25);border-top-color:#00a1d6;border-radius:50%;animation:ddpSpin .7s linear infinite;display:none}
         #__titan_dm_ddp_search .ddp-status.loading .ddp-spin{display:block}
@@ -1411,6 +1426,8 @@
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-ep .ttl{color:#333}
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-ep .load{color:#999}
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-status{color:#0070a8;border-color:rgba(0,0,0,0.06)}
+        html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-all-eps{color:#888;border-color:rgba(0,0,0,0.12)}
+        html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-all-eps:hover{color:#0070a8;border-color:rgba(0,161,214,0.4);background:rgba(0,161,214,0.06)}
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-loading{background:rgba(255,255,255,0.55)}
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-loading .big-txt{color:#0070a8}
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-empty{color:#999}
@@ -1934,6 +1951,7 @@
 
     let ddpLastResults = null;     // 上次 SearchEpisodesResponse（重开弹窗复显）
     let ddpCurrentAnime = null;    // 当前展开到剧集视图的作品
+    let ddpListIsFiltered = false; // 上次搜索是否按集号过滤过（过滤可能漏集，剧集视图给「获取全部剧集」入口）
 
     // 状态条 + 加载控制：opts.loading=true 显示 spinner + 遮罩 + 禁用搜索按钮（请求进行中）
     function ddpSetStatus(t, isErr, opts) {
@@ -1983,14 +2001,19 @@
       ddpCurrentAnime = a;
       const eps = a.episodes || [];
       $('__ddp_back__').style.display = '';
-      ddpSetStatus((a.animeTitle || '') + ' · ' + eps.length + ' 集 — 点击载入弹幕');
+      ddpSetStatus((a.animeTitle || '') + ' · ' + eps.length + ' 集 - 点击载入弹幕');
       const list = $('__ddp_list__');
-      list.innerHTML = eps.length ? eps.map((e, i) => `
+      let html = eps.length ? eps.map((e, i) => `
         <div class="ddp-ep" data-i="${i}">
           <span class="no">${escapeHtml(e.episodeNumber || (i + 1))}</span>
           <span class="ttl">${escapeHtml(e.episodeTitle || '')}</span>
-          <span class="load">载入 →</span>
+          <span class="load">载入 -></span>
         </div>`).join('') : '<div class="ddp-empty">该剧无剧集数据</div>';
+      // 筛选过的列表可能漏集：底部给「获取全部剧集」入口（仅当该剧尚未拉取全集）
+      if (ddpListIsFiltered && a.animeId && !a.__allEpsLoaded) {
+        html += `<div class="ddp-all-eps" id="__ddp_all_eps__" title="按集号筛选可能漏掉目标集，点击拉取该剧全部剧集">不在列表中？点击获取全部剧集</div>`;
+      }
+      list.innerHTML = html;
       list.scrollTop = 0;  // 切换到剧集视图回到顶部
       list.querySelectorAll('.ddp-ep').forEach(el => {
         el.addEventListener('click', () => {
@@ -2001,6 +2024,23 @@
           loadDandanplayComment(e.episodeId, label, { episodeId: e.episodeId, animeTitle: a.animeTitle, episodeTitle: e.episodeTitle });
         });
       });
+      const allEpsBtn = $('__ddp_all_eps__');
+      if (allEpsBtn) allEpsBtn.addEventListener('click', () => loadAllEpisodes(a));
+    }
+    // 拉取某作品的全部剧集（不过滤），替换当前剧集列表重新渲染
+    async function loadAllEpisodes(a) {
+      if (!a || !a.animeId) return;
+      try {
+        ddpSetStatus('获取全部剧集…', false, { loading: true });
+        const bg = await ddpGetBangumi(a.animeId);
+        const eps = (bg && bg.episodes) || [];
+        a.episodes = eps;
+        a.__allEpsLoaded = true;  // 标记已拉全集，不再显示按钮
+        renderDdpEpisodes(a);
+        ddpSetStatus((a.animeTitle || '') + ' · 共 ' + eps.length + ' 集 - 点击载入弹幕');
+      } catch (e) {
+        ddpSetStatus('获取全部剧集失败: ' + e.message, true);
+      }
     }
 
     // 经 Worker 拉某 episodeId 的弹幕并载入引擎（复用 applyDanmakuList，保留视频当前位置）
@@ -2027,6 +2067,7 @@
       try {
         ddpSetStatus('搜索中…', false, { loading: true });
         const res = await ddpSearchEpisodes(kw);
+        ddpListIsFiltered = false;  // 关键词搜索不过滤集号
         ddpCurrentAnime = null;
         $('__ddp_back__').style.display = 'none';
         renderDdpAnimes(res);
@@ -2086,6 +2127,7 @@
             ddpSetStatus('🤖 AI 提取: ' + ext.title + epLabel + '，搜索中…', false, { loading: true });
             // 特殊篇：不用 API 集数过滤（会把 SP1 当正片第1集），拿全部剧集供用户在列表里选
             const res = await ddpSearchEpisodes(ext.title, isSpecial ? '' : ext.episode);
+            ddpListIsFiltered = !isSpecial;  // 特殊篇未过滤；正片按集号过滤（可能漏集）
             const animes = (res && res.animes) || [];
             if (animes.length) {
               ddpLastResults = res;
@@ -2194,6 +2236,7 @@
         const isSpecial = want.kind === 'special';
         // 特殊篇（SP/OVA/OAD…）：API 集数过滤会把 SP1 当成正片第1集，故拿全部剧集后客户端定位
         const res = await ddpSearchEpisodes(ext.title, isSpecial ? '' : ext.episode);
+        ddpListIsFiltered = !isSpecial;  // 特殊篇未过滤；正片按集号过滤（可能漏集）
         const animes = (res && res.animes) || [];
         // 特殊篇：在每部作品的剧集列表里定位
         let picked = null, pickedAnime = null, pickedScore = 0;
