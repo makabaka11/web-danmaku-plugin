@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         今天要来点弹幕吗？
-// @version      1.2.1
+// @version      1.2.2
 // @description  在任意网页视频上加载 B 站网页版同款弹幕引擎（Titan）；OpenList 同目录自动载入 / 本地手动载入 / 弹弹play 在线搜索+智能匹配（支持 AI 增强全自动载入）；
 // @author       Retr0
 // @match        *://*/*
@@ -718,16 +718,14 @@
     return obj;
   }
 
-  // 关键词搜作品+剧集（主流程：一次拿到 animes[].episodes[]，无需再查详情）
-  // episode 可选：纯数字时 API 仅保留该集数结果（用于 AI 提取集号后精确定位）
-  async function ddpSearchEpisodes(anime, episode) {
-    const kw = (anime || '').trim();
+  // 关键词搜作品（/api/v2/search/anime）：返回所有匹配作品，但**不含剧集列表**（点作品时再用 bangumi/{id} 拉）。
+  // 用于手动关键词搜索（search/episodes 会漏作品，如搜 clannad 只回剧场版）。force=true 绕过缓存。
+  async function ddpSearchAnime(keyword, force) {
+    const kw = (keyword || '').trim();
     if (kw.length < 2) throw new Error('关键词至少 2 个字符');
-    const cacheKey = kw + '|' + (episode || '');
-    if (ddpCache.has(cacheKey)) return ddpCache.get(cacheKey);
-    const query = { anime: kw };
-    if (episode) query.episode = String(episode);
-    const obj = await ddpFetch('/api/v2/search/episodes', { query });
+    const cacheKey = 'anime:' + kw;
+    if (!force && ddpCache.has(cacheKey)) return ddpCache.get(cacheKey);
+    const obj = await ddpFetch('/api/v2/search/anime', { query: { keyword: kw } });
     const res = obj || { animes: [] };
     ddpCache.set(cacheKey, res);
     return res;
@@ -833,6 +831,27 @@
     scored.sort((a, b) => b.score - a.score);
     return scored[0];
   }
+  // 按集号规则从剧集列表里定位一集（bangumi/{id} 返回的剧集含 episodeNumber）。
+  // want.kind: main->episodeNumber==num；movie->标题含 剧场版/movie；special->pickSpecialEpisode。返回 episode 或 null。
+  function pickEpisode(episodes, want) {
+    if (!episodes || !episodes.length || !want) return null;
+    if (want.kind === 'movie') {
+      return episodes.find(e => /剧场版|劇場版|MOVIE/i.test(e.episodeTitle || '')) || null;
+    }
+    if (want.kind === 'special') {
+      const r = pickSpecialEpisode(episodes, want);
+      return r ? r.ep : null;
+    }
+    if (want.kind === 'main' && want.num != null) {
+      return episodes.find(e => {
+        const no = String(e.episodeNumber == null ? '' : e.episodeNumber).trim();
+        if (/^\d+$/.test(no) && parseInt(no, 10) === want.num) return true;  // 纯数字集号（避免 1.5/OVA1 误匹配）
+        const t = (e.episodeTitle || '').trim();
+        return new RegExp('第?\\s*0*' + want.num + '\\s*[话話集]').test(t) || t === String(want.num);
+      }) || null;
+    }
+    return null;
+  }
   async function llmExtractFileName(fileName) {
     const cfg = loadAiConfig();
     if (!aiReady()) return null;
@@ -885,6 +904,67 @@
       return { title, episode };
     } catch (e) {
       throw new Error('AI 提取失败: ' + e.message);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // AI 从剧集列表里判断 source 对应哪一集（番剧已锁定、集号不确定时用）。返回 episode 对象或 null（Err/无法判断/失败）
+  const LLM_PICK_SYSTEM_PROMPT =
+    '你是一个动漫剧集匹配助手。给定视频文件名/网页标题(source)和一部番剧的剧集列表(episodes，每项含 id/no/title)，请判断 source 对应哪一集。\n' +
+    '- 综合 source 里的集号/特殊篇标识(OVA/SP/OAD/S1 等)与 episodes 的 no/title 判断；季度(Season N/第N季)不是集号。\n' +
+    '- 只输出 JSON：选中输出 {"id": <id>}；无法判断输出 {"id": "Err"}。';
+  async function llmPickEpisode(episodes, sourceText) {
+    const cfg = loadAiConfig();
+    if (!aiReady()) return null;
+    const epList = (episodes || []).map(e => ({ id: e.episodeId, no: e.episodeNumber || '', title: e.episodeTitle || '' }));
+    if (!epList.length) return null;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), LLM_TIMEOUT_MS);
+    try {
+      const workerUrl = ddpWorkerUrl();
+      const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
+      const token = ddpProxyToken();
+      if (token) headers['X-Proxy-Token'] = token;
+      const r = await fetch(workerUrl + '/llm', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          baseUrl: cfg.baseUrl.trim(),
+          apiKey: cfg.apiKey.trim(),
+          model: cfg.model.trim(),
+          temperature: 0,
+          messages: [
+            { role: 'system', content: LLM_PICK_SYSTEM_PROMPT },
+            { role: 'user', content: 'source: ' + sourceText + '\nepisodes: ' + JSON.stringify(epList) },
+          ],
+        }),
+        signal: ctrl.signal,
+      });
+      const txt = await r.text();
+      if (!r.ok) {
+        let msg = '';
+        try { const ej = JSON.parse(txt || '{}'); msg = ej.errorMessage || ej.error?.message || ej.message || ''; } catch (e) {}
+        if (!msg) msg = (txt || '').slice(0, 200) || ('HTTP ' + r.status);
+        throw new Error(msg + '（HTTP ' + r.status + '）');
+      }
+      let j;
+      try { j = JSON.parse(txt); } catch (e) {
+        throw new Error('LLM 返回非 JSON 响应（' + (txt || '').slice(0, 120) + '）');
+      }
+      const content = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+      if (!content) return null;
+      const m = content.match(/\{[\s\S]*\}/);
+      if (!m) return null;
+      let parsed;
+      try { parsed = JSON.parse(m[0]); } catch (e) { return null; }
+      const id = parsed.id;
+      if (id == null || id === 'Err' || id === '') return null;
+      const numId = typeof id === 'number' ? id : parseInt(id, 10);
+      if (!numId || Number.isNaN(numId)) return null;
+      return episodes.find(e => e.episodeId === numId) || null;  // 必须是列表里的有效 id
+    } catch (e) {
+      throw new Error('AI 判断剧集失败: ' + e.message);
     } finally {
       clearTimeout(timer);
     }
@@ -1332,8 +1412,9 @@
         #__titan_dm_ddp_search .ddp-ep .ttl{flex:1;min-width:0;color:#ddd;font-size:12px;word-break:break-word;line-height:1.4}
         #__titan_dm_ddp_search .ddp-ep .load{font-size:10px;color:#666}
         /* 剧集列表底部「获取全部剧集」入口（筛选可能漏集时出现） */
-        #__titan_dm_ddp_search .ddp-all-eps{margin:10px 0 2px;padding:8px;text-align:center;font-size:11px;color:#888;cursor:pointer;border:1px dashed rgba(255,255,255,0.15);border-radius:6px;transition:all .12s}
-        #__titan_dm_ddp_search .ddp-all-eps:hover{color:#9cf;border-color:rgba(0,161,214,0.4);background:rgba(0,161,214,0.06)}
+        #__titan_dm_ddp_search .ddp-all-eps{padding:4px 16px 8px;text-align:center;font-size:11px;color:#888;cursor:pointer;transition:color .12s;flex:0 0 auto}
+        #__titan_dm_ddp_search .ddp-all-eps:hover{color:#9cf}
+        #__titan_dm_ddp_search .ddp-all-eps[hidden]{display:none}
         #__titan_dm_ddp_search .ddp-status{padding:8px 16px 12px;color:#9cf;font-size:11px;min-height:18px;border-top:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;gap:8px}
         #__titan_dm_ddp_search .ddp-status .ddp-spin{flex:0 0 auto;width:13px;height:13px;border:2px solid rgba(0,161,214,0.25);border-top-color:#00a1d6;border-radius:50%;animation:ddpSpin .7s linear infinite;display:none}
         #__titan_dm_ddp_search .ddp-status.loading .ddp-spin{display:block}
@@ -1426,8 +1507,8 @@
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-ep .ttl{color:#333}
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-ep .load{color:#999}
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-status{color:#0070a8;border-color:rgba(0,0,0,0.06)}
-        html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-all-eps{color:#888;border-color:rgba(0,0,0,0.12)}
-        html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-all-eps:hover{color:#0070a8;border-color:rgba(0,161,214,0.4);background:rgba(0,161,214,0.06)}
+        html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-all-eps{color:#888}
+        html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-all-eps:hover{color:#0070a8}
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-loading{background:rgba(255,255,255,0.55)}
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-loading .big-txt{color:#0070a8}
         html.__titan_dm_light__ #__titan_dm_ddp_search .ddp-empty{color:#999}
@@ -1548,7 +1629,7 @@
       <div class="modal-section">关于</div>
       <div class="about">
         <p><b class="about-brand"> 今天要来点弹幕吗？</b></p>
-        <p>脚本版本：<code id="__dm_ver_script__">1.2.1</code></p>
+        <p>脚本版本：<code id="__dm_ver_script__">1.2.2</code></p>
         <p>引擎：B 站原版 <code>bili-danmaku-x</code>代号[Titan]</p>
         <p>Bundle：<a href="https://cdn.jsdelivr.net/gh/makabaka11/DFM-Next@master/titan-bundle.js" target="_blank">jsDelivr</a>（11.4 MB）</p>
         <p>仓库：<a href="https://github.com/makabaka11/web-danmaku-plugin" target="_blank">github.com/makabaka11/web-danmaku-plugin</a></p>
@@ -1943,6 +2024,7 @@
         </div>
       </div>
       <div class="ddp-status" id="__ddp_status__"><span class="ddp-spin"></span><span class="ddp-status-txt"></span></div>
+      <div class="ddp-all-eps" id="__ddp_all_eps__" hidden title="按集号筛选可能漏掉目标集，点击拉取该剧全部剧集">不在列表中？点击获取全部剧集</div>
     `;
     document.body.appendChild(ddpModal);
     const ddpMask = document.createElement('div');
@@ -1981,18 +2063,20 @@
       const animes = (res && res.animes) || [];
       ddpLastResults = res;
       const list = $('__ddp_list__');
+      const allEpsBtn = $('__ddp_all_eps__');
+      if (allEpsBtn) allEpsBtn.hidden = true;  // 作品列表视图不显示「获取全部剧集」
       if (!animes.length) { list.innerHTML = '<div class="ddp-empty">无结果，换个关键词试试</div>'; return; }
       list.innerHTML = animes.map((a, i) => `
         <div class="ddp-anime" data-i="${i}">
           ${a.imageUrl ? `<img src="${escapeHtml(a.imageUrl)}" alt="" onerror="this.style.visibility='hidden'">` : '<img alt="" style="visibility:hidden">'}
           <div class="meta">
             <div class="ttl">${escapeHtml(a.animeTitle || ('#' + a.animeId))}</div>
-            <div class="sub">${animeTypeLabel(a.type)} · ${((a.episodes || []).length)} 集${a.startDate ? ' · ' + String(a.startDate).slice(0, 10) : ''}</div>
+            <div class="sub">${animeTypeLabel(a.type)} · ${a.episodes == null ? '点击查看剧集' : ((a.episodes || []).length) + ' 集'}${a.startDate ? ' · ' + String(a.startDate).slice(0, 10) : ''}</div>
           </div>
         </div>`).join('');
       list.scrollTop = 0;  // 切换到作品视图回到顶部
       list.querySelectorAll('.ddp-anime').forEach(el => {
-        el.addEventListener('click', () => renderDdpEpisodes(animes[+el.dataset.i]));
+        el.addEventListener('click', () => openAnimeEpisodes(animes[+el.dataset.i]));
       });
     }
 
@@ -2003,17 +2087,12 @@
       $('__ddp_back__').style.display = '';
       ddpSetStatus((a.animeTitle || '') + ' · ' + eps.length + ' 集 - 点击载入弹幕');
       const list = $('__ddp_list__');
-      let html = eps.length ? eps.map((e, i) => `
+      list.innerHTML = eps.length ? eps.map((e, i) => `
         <div class="ddp-ep" data-i="${i}">
           <span class="no">${escapeHtml(e.episodeNumber || (i + 1))}</span>
           <span class="ttl">${escapeHtml(e.episodeTitle || '')}</span>
           <span class="load">载入 -></span>
         </div>`).join('') : '<div class="ddp-empty">该剧无剧集数据</div>';
-      // 筛选过的列表可能漏集：底部给「获取全部剧集」入口（仅当该剧尚未拉取全集）
-      if (ddpListIsFiltered && a.animeId && !a.__allEpsLoaded) {
-        html += `<div class="ddp-all-eps" id="__ddp_all_eps__" title="按集号筛选可能漏掉目标集，点击拉取该剧全部剧集">不在列表中？点击获取全部剧集</div>`;
-      }
-      list.innerHTML = html;
       list.scrollTop = 0;  // 切换到剧集视图回到顶部
       list.querySelectorAll('.ddp-ep').forEach(el => {
         el.addEventListener('click', () => {
@@ -2024,15 +2103,16 @@
           loadDandanplayComment(e.episodeId, label, { episodeId: e.episodeId, animeTitle: a.animeTitle, episodeTitle: e.episodeTitle });
         });
       });
+      // 「获取全部剧集」入口（在底部状态栏下方，常驻 DOM）：仅筛选过的剧集视图显示
       const allEpsBtn = $('__ddp_all_eps__');
-      if (allEpsBtn) allEpsBtn.addEventListener('click', () => loadAllEpisodes(a));
+      if (allEpsBtn) allEpsBtn.hidden = !(ddpListIsFiltered && a.animeId && !a.__allEpsLoaded);
     }
     // 拉取某作品的全部剧集（不过滤），替换当前剧集列表重新渲染
     async function loadAllEpisodes(a) {
-      if (!a || !a.animeId) return;
+      if (!a || (a.bangumiId == null && a.animeId == null)) return;
       try {
         ddpSetStatus('获取全部剧集…', false, { loading: true });
-        const bg = await ddpGetBangumi(a.animeId);
+        const bg = await ddpGetBangumi(a.bangumiId || a.animeId);
         const eps = (bg && bg.episodes) || [];
         a.episodes = eps;
         a.__allEpsLoaded = true;  // 标记已拉全集，不再显示按钮
@@ -2041,6 +2121,24 @@
       } catch (e) {
         ddpSetStatus('获取全部剧集失败: ' + e.message, true);
       }
+    }
+    // 点击作品进入剧集视图：关键词搜索（search/anime）结果无剧集 -> 先用 bangumi/{id} 拉全剧剧集
+    async function openAnimeEpisodes(a) {
+      if (!a) return;
+      if (!a.episodes) {
+        const id = a.bangumiId || a.animeId;
+        if (id == null) { ddpSetStatus('该作品无 ID，无法加载剧集', true); return; }
+        try {
+          ddpSetStatus('加载「' + (a.animeTitle || '') + '」剧集…', false, { loading: true });
+          const bg = await ddpGetBangumi(id);
+          a.episodes = (bg && bg.episodes) || [];
+          a.__allEpsLoaded = true;  // bangumi 返回的即全集
+        } catch (e) {
+          ddpSetStatus('加载剧集失败: ' + e.message, true);
+          return;
+        }
+      }
+      renderDdpEpisodes(a);
     }
 
     // 经 Worker 拉某 episodeId 的弹幕并载入引擎（复用 applyDanmakuList，保留视频当前位置）
@@ -2066,7 +2164,7 @@
       if (!ddpReady()) { ddpSetStatus('未配置代理，请先在通用设置填写 Worker URL', true); return; }
       try {
         ddpSetStatus('搜索中…', false, { loading: true });
-        const res = await ddpSearchEpisodes(kw);
+        const res = await ddpSearchAnime(kw, true);  // 关键词搜索走 /api/v2/search/anime（返回全部作品，不含剧集），强制绕过缓存
         ddpListIsFiltered = false;  // 关键词搜索不过滤集号
         ddpCurrentAnime = null;
         $('__ddp_back__').style.display = 'none';
@@ -2121,29 +2219,18 @@
           ddpSetStatus('🤖 AI 提取中… ' + matchText.slice(0, 50), false, { loading: true });
           const ext = await llmExtractFileName(matchText);
           if (ext && ext.title) {
-            const want = parseWantEpisode(ext.episode);
-            const isSpecial = want.kind === 'special';
             const epLabel = ext.episode === 'movie' ? '（剧场版）' : (ext.episode ? ' ' + ext.episode : '');
             ddpSetStatus('🤖 AI 提取: ' + ext.title + epLabel + '，搜索中…', false, { loading: true });
-            // 特殊篇：不用 API 集数过滤（会把 SP1 当正片第1集），拿全部剧集供用户在列表里选
-            const res = await ddpSearchEpisodes(ext.title, isSpecial ? '' : ext.episode);
-            ddpListIsFiltered = !isSpecial;  // 特殊篇未过滤；正片按集号过滤（可能漏集）
+            // 搜作品（/api/v2/search/anime：返回全部作品，不含剧集）；点作品后再拉剧集
+            const res = await ddpSearchAnime(ext.title);
+            ddpListIsFiltered = false;
             const animes = (res && res.animes) || [];
             if (animes.length) {
               ddpLastResults = res;
               ddpCurrentAnime = null;
               $('__ddp_back__').style.display = 'none';
               renderDdpAnimes(res);
-              // 特殊篇尝试客户端定位，提示是否找到
-              let locateMsg = '';
-              if (isSpecial) {
-                let found = false;
-                for (const a of animes) { if (pickSpecialEpisode(a.episodes, want)) { found = true; break; } }
-                locateMsg = found ? '（已定位 ' + ext.episode + '，请在作品内点选）' : '（' + ext.episode + ' 请手动选择）';
-              } else if (ext.episode) {
-                locateMsg = '（已定位 ' + ext.episode + '）';
-              }
-              ddpSetStatus('🤖 AI 命中 ' + animes.length + ' 部作品' + locateMsg + '，点击载入');
+              ddpSetStatus('🤖 AI 命中 ' + animes.length + ' 部作品，点击查看剧集');
               return;
             }
             ddpSetStatus('🤖 AI 提取到「' + ext.title + '」但未搜到作品，请调整关键词', true);
@@ -2206,7 +2293,11 @@
       $('__ddp_back__').style.display = 'none';
       if (prefillKw != null) $('__ddp_kw__').value = prefillKw;
       if (ddpLastResults) renderDdpAnimes(ddpLastResults);
-      else { $('__ddp_list__').innerHTML = '<div class="ddp-empty">输入关键词后回车搜索</div>'; ddpSetStatus(''); }
+      else {
+        $('__ddp_list__').innerHTML = '<div class="ddp-empty">输入关键词后回车搜索</div>';
+        const aeb = $('__ddp_all_eps__'); if (aeb) aeb.hidden = true;  // 无结果时隐藏「获取全部剧集」
+        ddpSetStatus('');
+      }
       refreshAiMatchVisibility();  // 搜索弹窗内的「智能匹配」按钮按 AI 开关显隐
       setTimeout(() => $('__ddp_kw__').focus(), 60);
     }
@@ -2233,46 +2324,67 @@
         const ext = await llmExtractFileName(title);
         if (!ext || !ext.title) { showStatus('⚠️ 自动匹配：AI 未能从标题提取番剧信息（' + title.slice(0,30) + '…）', 6000); return; }
         const want = parseWantEpisode(ext.episode);
-        const isSpecial = want.kind === 'special';
-        // 特殊篇（SP/OVA/OAD…）：API 集数过滤会把 SP1 当成正片第1集，故拿全部剧集后客户端定位
-        const res = await ddpSearchEpisodes(ext.title, isSpecial ? '' : ext.episode);
-        ddpListIsFiltered = !isSpecial;  // 特殊篇未过滤；正片按集号过滤（可能漏集）
+        // ① 搜作品（/api/v2/search/anime：返回全部匹配作品，不含剧集）
+        const res = await ddpSearchAnime(ext.title);
+        ddpListIsFiltered = false;  // 搜作品未按集号过滤
         const animes = (res && res.animes) || [];
-        // 特殊篇：在每部作品的剧集列表里定位
-        let picked = null, pickedAnime = null, pickedScore = 0;
-        if (isSpecial && animes.length) {
-          for (const a of animes) {
-            const r = pickSpecialEpisode(a.episodes, want);
-            if (r) { picked = r.ep; pickedAnime = a; pickedScore = r.score; break; }
-          }
+        if (!animes.length) {
+          showStatus('⚠️ 自动匹配：未搜到「' + ext.title + '」，请手动搜索', 8000);
+          return;
         }
-        // 唯一定位到一集：正片单结果 / 特殊篇定位成功且唯一作品且匹配可信
-        const singleMain = !isSpecial && animes.length === 1 && animes[0].episodes && animes[0].episodes.length === 1;
-        const confidentSpecial = isSpecial && animes.length === 1 && picked && (want.num == null ? pickedScore >= 50 : pickedScore >= 100);
-        if (singleMain || confidentSpecial) {
-          const a = isSpecial ? pickedAnime : animes[0];
-          const e = isSpecial ? picked : animes[0].episodes[0];
+
+        // 载入指定剧集的共用管线（拉弹幕 -> 载入引擎 -> 缓存 -> 提示）；成功返回 true
+        const loadEp = async (a, e) => {
           const label = (a.animeTitle || '') + ' ' + (e.episodeTitle || ext.episode || ('第' + (e.episodeNumber || 1) + '集'));
           let comments;
           try { comments = (await ddpGetComment(e.episodeId)).comments || []; }
-          catch (err) { showStatus('⚠️ 自动匹配：拉取弹幕失败（' + err.message + '）', 8000); return; }
+          catch (err) { showStatus('⚠️ 自动匹配：拉取弹幕失败（' + err.message + '）', 8000); return false; }
           const rawList = ddpCommentsToList(comments);
-          if (!rawList.length) { showStatus('⚠️ 自动匹配：' + label + ' 该集暂无弹幕', 6000); return; }
+          if (!rawList.length) { showStatus('⚠️ 自动匹配：' + label + ' 该集暂无弹幕', 6000); return false; }
           applyDanmakuList(rawList, label, { seekTo: video.currentTime || 0 });
           putMatchCache(video, { episodeId: e.episodeId, animeTitle: a.animeTitle, episodeTitle: e.episodeTitle });
           showStatus('🎬 自动载入: ' + label + ' · ' + rawList.length + ' 条');
+          return true;
+        };
+
+        // ② 锁定作品：唯一作品直接锁定并确定剧集；多作品交给用户在弹窗里选
+        if (animes.length === 1) {
+          const a = animes[0];
+          // ③ 拉取该剧全部剧集（bangumi/{id}）
+          showStatus('🤖 已锁定「' + (a.animeTitle || ext.title) + '」，加载剧集…', 0);
+          let eps = a.episodes;
+          if (!eps) {
+            try {
+              const bg = await ddpGetBangumi(a.bangumiId || a.animeId);
+              eps = (bg && bg.episodes) || [];
+              a.episodes = eps; a.__allEpsLoaded = true;
+            } catch (e) { eps = []; }
+          }
+          // ④ 规则定位剧集（正片按集号 / 剧场版 / 特殊篇）
+          const e = pickEpisode(eps, want);
+          if (e && await loadEp(a, e)) return;
+          // ⑤ 规则定位不到 -> AI 从剧集列表判断
+          if (eps.length) {
+            showStatus('🤖 已锁定「' + (a.animeTitle || ext.title) + '」，AI 判断剧集中…', 0);
+            try {
+              const aiEp = await llmPickEpisode(eps, title);
+              if (aiEp && await loadEp(a, aiEp)) return;
+            } catch (e) { /* 落到弹窗 */ }
+          }
+          // ⑥ 仍无法确定 -> 弹窗展示该剧剧集让用户选
+          ddpLastResults = res;
+          $('__ddp_kw__').value = ext.title;
+          openDdpModal();
+          renderDdpEpisodes(a);  // 直接进剧集视图
+          ddpSetStatus('🤖 已锁定「' + (a.animeTitle || '') + '」，请选择剧集');
           return;
         }
-        // 未定位 / 多结果 -> 打开搜索弹窗让用户手动选
-        if (animes.length === 0) {
-          showStatus('⚠️ 自动匹配：未搜到「' + ext.title + (ext.episode ? ' ' + ext.episode : '') + '」，请手动搜索', 8000);
-          return;
-        }
-        ddpLastResults = res;       // 缓存搜索结果供弹窗复显
-        $('__ddp_kw__').value = ext.title;  // 预填 AI 提取的标题
-        renderDdpAnimes(res);       // 渲染作品列表（用户点作品 -> 列剧集 -> 点剧集载入）
-        openDdpModal();             // 打开弹窗（会 closeMenu + 聚焦搜索框）
-        ddpSetStatus('🤖 AI 命中 ' + animes.length + ' 部作品' + (isSpecial ? '（' + ext.episode + ' 未自动定位，请手动选择）' : '，请选择'));
+
+        // ⑦ 多作品 -> 弹窗让用户选作品（点作品后再拉剧集）
+        ddpLastResults = res;
+        $('__ddp_kw__').value = ext.title;
+        openDdpModal();
+        ddpSetStatus('🤖 AI 命中 ' + animes.length + ' 部作品，请选择');
         showStatus('🤖 自动匹配到多部作品，已弹出列表请选择', 6000);
       } catch (e) { showStatus('⚠️ 自动匹配失败: ' + (e && e.message ? e.message : e), 8000); }
     }
@@ -2281,6 +2393,9 @@
 
     $('__ddp_close__').addEventListener('click', closeDdpModal);
     ddpMask.addEventListener('click', closeDdpModal);
+    // 「获取全部剧集」（常驻 DOM，点击时取当前作品）
+    const __allEpsBtn = $('__ddp_all_eps__');
+    if (__allEpsBtn) __allEpsBtn.addEventListener('click', () => { if (ddpCurrentAnime) loadAllEpisodes(ddpCurrentAnime); });
     $('__ddp_back__').addEventListener('click', () => {
       ddpCurrentAnime = null;
       $('__ddp_back__').style.display = 'none';
@@ -2829,5 +2944,5 @@
   } catch (e) { console.error('[web-danmaku-plugin] init error:', e); }
 
   // 暴露核心函数供 dev/test 端到端验证（生产环境无害，单一命名空间）
-  window.__titan = { injectControls: injectDanmakuControls, getEngine, createAdapter, parseAny, parseDandanplayApi, ddpCommentsToList, filePathFromVideo, getPageTitle, loadDdpConfig, saveDdpConfig, ddpSearchEpisodes, ddpGetComment, ddpMatch, loadMatchCache, saveMatchCache, getMatchCache, putMatchCache, clearMatchCache, matchCacheKeyOf, loadAiConfig, saveAiConfig, aiReady, aiEnabled, autoMatchEnabled, llmExtractFileName, loadResume, saveResume, clearResume, loadBlacklist, saveBlacklist, blacklistEnabled, isUrlBlacklisted, getRootDomain, isNewSite, markSiteSeen, promptNewSiteBlacklist, pageTitleSnapshot: _PAGE_TITLE_SNAPSHOT, engine: null, adapter: null, setStatus: null, openSettings: openSettingsModal };
+  window.__titan = { injectControls: injectDanmakuControls, getEngine, createAdapter, parseAny, parseDandanplayApi, ddpCommentsToList, filePathFromVideo, getPageTitle, loadDdpConfig, saveDdpConfig, ddpSearchAnime, ddpGetComment, ddpMatch, loadMatchCache, saveMatchCache, getMatchCache, putMatchCache, clearMatchCache, matchCacheKeyOf, loadAiConfig, saveAiConfig, aiReady, aiEnabled, autoMatchEnabled, llmExtractFileName, llmPickEpisode, loadResume, saveResume, clearResume, loadBlacklist, saveBlacklist, blacklistEnabled, isUrlBlacklisted, getRootDomain, isNewSite, markSiteSeen, promptNewSiteBlacklist, pageTitleSnapshot: _PAGE_TITLE_SNAPSHOT, engine: null, adapter: null, setStatus: null, openSettings: openSettingsModal };
 })();
